@@ -1,0 +1,3238 @@
+// ==UserScript==
+// @name         DVFU LMS Autopilot v19.0 — Accuracy Edition
+// @namespace    http://tampermonkey.net/
+// @version      19.0.0
+// @match        *://lms.dvfu.ru/*
+// @grant        GM_xmlhttpRequest
+// @connect      token-shop.online
+// @connect      files.teachbase.ru
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // API KEY — вставь новый ключ Tokenwave в эту строку
+    const API_KEY = "";
+
+    const API_URL = "https://token-shop.online/v1/chat/completions";
+
+    const PRIMARY_MODEL = 'claude-haiku-4-5-20251001';
+    const REVIEW_MODEL = PRIMARY_MODEL;
+    // Арбитр использует ту же модель каталога, чтобы не зависеть от устаревших имён моделей.
+    const JUDGE_MODEL = PRIMARY_MODEL;
+    const JUDGE_CONFIDENCE_THRESHOLD = 0.72;
+    // Для служебных действий с эссе (упростить/укоротить) используем GPT-6 Sol.
+    const MODELS = [PRIMARY_MODEL];
+
+    const CONFIG = {
+        timeout: 45000,
+        delay: 500,
+        autoSubmit: true
+    };
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    let running = false;
+    let busy = false;
+    let generation = 0;
+    let activeRequest = null;
+
+    const handled = new Set();
+    const retryAfter = new Map();
+
+    // Журнал аудита хранится локально в браузере на домене LMS.
+    const AUDIT_STORAGE_KEY = 'dvfu_lms_autopilot_audit_v18';
+    const AUDIT_MAX_ENTRIES = 300;
+    let auditEntries = [];
+    let auditSequence = 0;
+    let lastUsedModel = '';
+    let currentAuditEntryId = null;
+    let essayTargetAuditId = null;
+    let auditPanel = null;
+    let auditViewer = null;
+    let auditButton = null;
+
+    try {
+        const storedAudit = localStorage.getItem(AUDIT_STORAGE_KEY);
+        const parsedAudit = storedAudit ? JSON.parse(storedAudit) : [];
+        if (Array.isArray(parsedAudit)) auditEntries = parsedAudit;
+    } catch (error) {
+        console.warn('[DVFU LMS v19.0] Не удалось прочитать локальный журнал:', error);
+    }
+    auditSequence = auditEntries.reduce((max, item) => Math.max(max, Number(item.number) || 0), 0);
+
+    let essayPanel = null;
+    let essayReopenButton = null;
+    let essayDraftInput = null;
+    let essayQuestionLabel = null;
+    let essayPanelStatus = null;
+    let essayCustomPromptInput = null;
+    let essayAstraStatus = null;
+    let essayCurrentQuestion = '';
+    let essayTargetField = null;
+    let essayTargetFingerprint = '';
+    let essayBusy = false;
+
+    // Ручной визуальный анализ скриншота через GPT-6 Luna.
+    let screenshotButton = null;
+    let screenshotPanel = null;
+    let screenshotPreview = null;
+    let screenshotPromptInput = null;
+    let screenshotResultInput = null;
+    let screenshotStatus = null;
+    let screenshotDataUrl = '';
+    let screenshotBusy = false;
+    let screenshotRequest = null;
+    let screenshotAuditId = null;
+
+    // Автоматическое чтение вложений текущего вопроса: PNG/JPG/JPEG/DOCX.
+    let attachmentContextText = '';
+    let attachmentContextFingerprint = '';
+    let attachmentPreparationFingerprint = '';
+    let attachmentFailedFingerprint = '';
+    let activeAttachmentMetadata = [];
+    let attachmentDownloadRequest = null;
+
+    // =====================================
+    // 1. ОБЩИЕ ФУНКЦИИ
+    // =====================================
+
+    function visible(el) {
+        return !!el &&
+            el.isConnected &&
+            el.getClientRects().length > 0 &&
+            getComputedStyle(el).display !== 'none' &&
+            getComputedStyle(el).visibility !== 'hidden';
+    }
+
+    function getText(el) {
+        return String(el?.innerText || el?.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function norm(value) {
+        return String(value || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    function check(token) {
+        if (!running || token !== generation) {
+            throw new Error('Автопилот остановлен');
+        }
+    }
+
+    function setStatus(message, color = '#10b981') {
+        button.textContent = message;
+        button.style.background = color;
+        console.log('[DVFU LMS v19.0]', message);
+    }
+    const status = setStatus;
+
+    // Единая вертикальная панель управления: кнопки не перекрывают друг друга.
+    const controlDock = document.createElement('div');
+    controlDock.id = 'dvfu-control-dock-v190';
+    controlDock.setAttribute('aria-label', 'Панель управления автопилотом');
+    controlDock.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:9999999;display:flex;flex-direction:column;align-items:stretch;gap:8px;width:min(250px,calc(100vw - 24px));max-height:calc(100vh - 32px);overflow:visible;pointer-events:none;box-sizing:border-box';
+    document.body.appendChild(controlDock);
+
+    function addDockButton(element) {
+        element.style.position = 'static';
+        element.style.inset = 'auto';
+        element.style.float = 'none';
+        element.style.transform = 'none';
+        element.style.display = element.style.display === 'none' ? 'none' : 'flex';
+        element.style.width = '100%';
+        element.style.minWidth = '0';
+        element.style.maxWidth = '100%';
+        element.style.minHeight = '42px';
+        element.style.height = 'auto';
+        element.style.margin = '0';
+        element.style.boxSizing = 'border-box';
+        element.style.whiteSpace = 'normal';
+        element.style.overflowWrap = 'anywhere';
+        element.style.justifyContent = 'center';
+        element.style.alignItems = 'center';
+        element.style.textAlign = 'center';
+        element.style.pointerEvents = 'auto';
+        controlDock.appendChild(element);
+    }
+
+    // =====================================
+    // 2. КНОПКА
+    // =====================================
+
+    const button = document.createElement('button');
+
+    button.textContent = '🚀 Автопилот v19.0';
+
+    button.style.cssText = 'padding:12px 14px;border:0;border-radius:12px;background:#10b981;color:#fff;font:bold 14px/1.3 Arial,sans-serif;cursor:pointer;box-shadow:0 4px 15px #0004';
+
+
+    button.id = 'dvfu-autopilot-v190';
+    addDockButton(button);
+
+    button.onclick = () => {
+        running = !running;
+        generation++;
+
+        if (!running) {
+            activeRequest?.abort?.();
+            activeRequest = null;
+            attachmentDownloadRequest?.abort?.();
+            attachmentDownloadRequest = null;
+            screenshotRequest?.abort?.();
+            screenshotRequest = null;
+            busy = false;
+
+            setStatus('🚀 Автопилот v19.0');
+        } else {
+            setStatus('⏸️ Автопилот работает', '#ef4444');
+        }
+    };
+
+
+    // =====================================
+    // 2A. ЖУРНАЛ АУДИТА v18.4
+    // =====================================
+
+    function saveAudit() {
+        try {
+            if (auditEntries.length > AUDIT_MAX_ENTRIES) {
+                auditEntries = auditEntries.slice(-AUDIT_MAX_ENTRIES);
+            }
+            localStorage.setItem(AUDIT_STORAGE_KEY, JSON.stringify(auditEntries));
+        } catch (error) {
+            console.warn('[DVFU LMS v19.0] Не удалось сохранить журнал:', error);
+        }
+        renderAudit();
+    }
+
+    function auditCreate(data) {
+        const questionInfo = getQuestionInfo();
+        const entry = {
+            id: `${Date.now()}-${auditSequence + 1}`,
+            number: ++auditSequence,
+            createdAt: new Date().toISOString(),
+            type: data.type || 'UNKNOWN',
+            question: data.question || questionInfo.text || '',
+            questionSource: data.questionSource || questionInfo.source || '',
+            questionNumber: data.questionNumber ?? questionInfo.number ?? null,
+            status: 'started',
+            model: '',
+            generationModel: '',
+            lastActionModel: '',
+            chosenModel: '',
+            agreement: null,
+            selectionSource: '',
+            modelAnswers: [],
+            options: data.options || [],
+            slots: data.slots || [],
+            cards: data.cards || [],
+            attachments: Array.isArray(data.attachments)
+                ? data.attachments.map(item => ({ ...item }))
+                : (Array.isArray(activeAttachmentMetadata) ? activeAttachmentMetadata.map(item => ({ ...item })) : []),
+            selectedIndexes: [],
+            selectedAnswers: [],
+            rawModelResponse: '',
+            draft: '',
+            finalDraft: '',
+            error: '',
+            events: []
+        };
+        auditEntries.push(entry);
+        currentAuditEntryId = entry.id;
+        saveAudit();
+        auditEvent(entry.id, 'started', { type: entry.type });
+        return entry.id;
+    }
+
+    function auditUpdate(id, patch) {
+        if (!id) return;
+        const entry = auditEntries.find(item => item.id === id);
+        if (!entry) return;
+        Object.assign(entry, patch || {});
+        entry.updatedAt = new Date().toISOString();
+        saveAudit();
+    }
+
+    function auditEvent(id, action, details = {}) {
+        if (!id) return;
+        const entry = auditEntries.find(item => item.id === id);
+        if (!entry) return;
+        entry.events = Array.isArray(entry.events) ? entry.events : [];
+        entry.events.push({
+            at: new Date().toISOString(),
+            action,
+            details
+        });
+        saveAudit();
+    }
+
+    function auditError(id, error) {
+        if (!id) return;
+        const message = error?.message || String(error);
+        auditUpdate(id, { status: 'error', error: message });
+        auditEvent(id, 'error', { message });
+    }
+
+    function renderAudit() {
+        if (!auditViewer) return;
+        const latest = auditEntries.slice(-50).reverse();
+        auditViewer.value = JSON.stringify(latest, null, 2);
+        const count = auditPanel?.querySelector('[data-audit-count]');
+        if (count) count.textContent = `Записей: ${auditEntries.length} · показаны последние ${latest.length}`;
+    }
+
+    function exportAudit() {
+        const payload = JSON.stringify({
+            exportedAt: new Date().toISOString(),
+            version: '18.6',
+            entries: auditEntries
+        }, null, 2);
+        const blob = new Blob([payload], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `dvfu-lms-audit-${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+    }
+
+    function ensureAuditUI() {
+        if (auditPanel?.isConnected) return;
+
+        auditButton = document.createElement('button');
+        auditButton.id = 'dvfu-audit-button-v190';
+        auditButton.type = 'button';
+        auditButton.textContent = '📋 Журнал';
+        auditButton.style.cssText = `
+            position:static; width:100%; box-sizing:border-box; padding:11px 14px; border:0; border-radius:24px;
+            background:#334155; color:#fff; font:700 13px Arial,sans-serif;
+            cursor:pointer; box-shadow:0 4px 16px rgba(15,23,42,.25);
+        `;
+        addDockButton(auditButton);
+
+        auditPanel = document.createElement('section');
+        auditPanel.id = 'dvfu-audit-panel-v190';
+        auditPanel.setAttribute('role', 'dialog');
+        auditPanel.setAttribute('aria-label', 'Журнал аудита DVFU LMS');
+        auditPanel.style.cssText = `
+            position:fixed; z-index:10000002; top:5vh; right:20px;
+            width:min(760px, calc(100vw - 40px)); height:90vh;
+            display:none; flex-direction:column; gap:10px; padding:16px;
+            box-sizing:border-box; background:#fff; color:#172033;
+            border:1px solid #cbd5e1; border-radius:14px;
+            box-shadow:0 12px 42px rgba(15,23,42,.3);
+            font:13px/1.4 Arial,sans-serif;
+        `;
+        auditPanel.innerHTML = `
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+                <div style="font-size:18px;font-weight:700">Журнал аудита v19.0 — Sol + Luna и Astra при необходимости</div>
+                <button type="button" data-audit-close style="border:0;background:transparent;font-size:22px;cursor:pointer;color:#64748b">×</button>
+            </div>
+            <div data-audit-count style="color:#64748b">Записей: 0</div>
+            <div style="color:#475569">Сохраняется только в этом браузере. В журнал не записывается API-ключ. GPT-6 Sol ×4 и GPT-6 Luna ×1,3; GPT-6 Astra ×10 вызывается только при необходимости по каталогу TokenWave. Совпадение моделей не гарантирует правильность ответа.</div>
+            <textarea readonly data-audit-viewer spellcheck="false" style="flex:1;min-height:160px;width:100%;resize:none;box-sizing:border-box;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font:11px/1.45 Consolas,monospace;color:#172033;background:#f8fafc"></textarea>
+            <div style="display:flex;flex-wrap:wrap;gap:8px">
+                <button type="button" data-audit-refresh style="padding:9px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;cursor:pointer">Обновить</button>
+                <button type="button" data-audit-export style="padding:9px 12px;border:0;border-radius:8px;background:#2563eb;color:#fff;cursor:pointer">Экспорт JSON</button>
+                <button type="button" data-audit-clear style="padding:9px 12px;border:1px solid #fecaca;border-radius:8px;background:#fff;color:#b91c1c;cursor:pointer">Очистить журнал</button>
+            </div>
+        `;
+        document.body.appendChild(auditPanel);
+        auditViewer = auditPanel.querySelector('[data-audit-viewer]');
+
+        auditButton.addEventListener('click', () => {
+            renderAudit();
+            auditPanel.style.display = 'flex';
+        });
+        auditPanel.querySelector('[data-audit-close]').addEventListener('click', () => {
+            auditPanel.style.display = 'none';
+        });
+        auditPanel.querySelector('[data-audit-refresh]').addEventListener('click', renderAudit);
+        auditPanel.querySelector('[data-audit-export]').addEventListener('click', exportAudit);
+        auditPanel.querySelector('[data-audit-clear]').addEventListener('click', () => {
+            if (!confirm('Удалить все записи журнала аудита на этом сайте?')) return;
+            auditEntries = [];
+            auditSequence = 0;
+            try { localStorage.removeItem(AUDIT_STORAGE_KEY); } catch (_) {}
+            renderAudit();
+        });
+        renderAudit();
+    }
+
+    ensureAuditUI();
+    ensureScreenshotUI();
+
+    // =====================================
+    // 2B. РУЧНОЙ ВИЗУАЛЬНЫЙ РЕЖИМ — SCREENSHOT → GPT-6 LUNA
+    // =====================================
+
+    function ensureScreenshotUI() {
+        if (screenshotPanel?.isConnected) return;
+
+        const styleId = 'dvfu-screenshot-solver-style-v190';
+        if (!document.getElementById(styleId)) {
+            const style = document.createElement('style');
+            style.id = styleId;
+            style.textContent = `
+                #dvfu-screenshot-panel-v190 {
+                    position:fixed; z-index:10000040; top:50%; left:50%; transform:translate(-50%,-50%);
+                    width:min(760px,calc(100vw - 28px)); max-height:calc(100vh - 28px);
+                    display:none; flex-direction:column; gap:10px; padding:16px; box-sizing:border-box;
+                    overflow:auto; background:#fff; color:#172033; border:1px solid #cbd5e1;
+                    border-radius:16px; box-shadow:0 14px 48px rgba(15,23,42,.32); font:14px/1.45 Arial,sans-serif;
+                }
+                #dvfu-screenshot-panel-v190 * { box-sizing:border-box; min-width:0; }
+                #dvfu-screenshot-panel-v190 button {
+                    appearance:none !important; position:static !important; inset:auto !important; float:none !important;
+                    transform:none !important; display:flex !important; align-items:center !important; justify-content:center !important;
+                    width:100% !important; min-width:0 !important; max-width:100% !important; min-height:40px !important; height:auto !important;
+                    margin:0 !important; padding:10px 12px !important; border:1px solid #cbd5e1 !important; border-radius:9px !important;
+                    background:#f8fafc !important; color:#172033 !important; font:600 13px/1.35 Arial,sans-serif !important;
+                    text-align:center !important; white-space:normal !important; overflow-wrap:anywhere !important; cursor:pointer !important;
+                    box-shadow:none !important;
+                }
+                #dvfu-screenshot-panel-v190 button:disabled { opacity:.5 !important; cursor:wait !important; }
+                #dvfu-screenshot-panel-v190 textarea {
+                    display:block; position:static; width:100%; max-width:100%; margin:0; padding:10px 12px;
+                    border:1px solid #cbd5e1; border-radius:9px; background:#fff; color:#172033;
+                    font:14px/1.5 Arial,sans-serif; resize:vertical; box-shadow:none;
+                }
+                #dvfu-screenshot-panel-v190 [data-shot-prompt] { min-height:86px; max-height:22vh; font:13px/1.45 Arial,sans-serif; }
+                #dvfu-screenshot-panel-v190 [data-shot-result] { min-height:160px; max-height:32vh; }
+                #dvfu-screenshot-panel-v190 .dvfu-shot-row { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; width:100%; }
+                #dvfu-screenshot-panel-v190 .dvfu-shot-primary { background:#059669 !important; color:#fff !important; border-color:#059669 !important; }
+                #dvfu-screenshot-panel-v190 .dvfu-shot-header { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+                #dvfu-screenshot-panel-v190 .dvfu-shot-close { width:38px !important; min-width:38px !important; max-width:38px !important; padding:0 !important; border:0 !important; background:transparent !important; font-size:24px !important; }
+                #dvfu-screenshot-panel-v190 [data-shot-status] { overflow-wrap:anywhere; }
+                @media(max-width:640px) {
+                    #dvfu-screenshot-panel-v190 { top:10px; bottom:10px; left:10px; right:10px; transform:none; width:auto; max-height:none; padding:12px; }
+                    #dvfu-screenshot-panel-v190 .dvfu-shot-row { grid-template-columns:1fr; }
+                }
+                #dvfu-control-dock-v190 > button { appearance:none !important; position:static !important; inset:auto !important; float:none !important; transform:none !important; width:100% !important; min-width:0 !important; max-width:100% !important; min-height:42px !important; height:auto !important; margin:0 !important; box-sizing:border-box !important; white-space:normal !important; overflow-wrap:anywhere !important; line-height:1.3 !important; }
+                @media(max-width:520px) { #dvfu-control-dock-v190 { right:12px !important; bottom:12px !important; width:min(230px,calc(100vw - 24px)) !important; } }
+            `;
+            document.head.appendChild(style);
+        }
+
+        screenshotButton = document.createElement('button');
+        screenshotButton.id = 'dvfu-screenshot-button';
+        screenshotButton.type = 'button';
+        screenshotButton.textContent = '📸 Решить по скриншоту';
+        screenshotButton.style.cssText = 'padding:11px 14px;border:0;border-radius:12px;background:#7c3aed;color:#fff;font:700 13px/1.3 Arial,sans-serif;cursor:pointer;box-shadow:0 4px 16px rgba(15,23,42,.25)';
+        addDockButton(screenshotButton);
+
+        screenshotPanel = document.createElement('section');
+        screenshotPanel.id = 'dvfu-screenshot-panel-v190';
+        screenshotPanel.setAttribute('role', 'dialog');
+        screenshotPanel.setAttribute('aria-modal', 'false');
+        screenshotPanel.setAttribute('aria-label', 'Визуальное решение задания через GPT-6 Luna');
+        screenshotPanel.innerHTML = `
+            <div class="dvfu-shot-header">
+                <div style="font-size:18px;font-weight:700">📸 Визуальный анализ — GPT-6 Luna</div>
+                <button type="button" class="dvfu-shot-close" data-shot-close aria-label="Закрыть">×</button>
+            </div>
+            <div style="font-size:12px;color:#64748b">Нажми «Сделать скриншот», затем в окне браузера выбери текущую вкладку LMS. Скрипт захватит один кадр и остановит демонстрацию экрана.</div>
+            <button type="button" class="dvfu-shot-primary" data-shot-capture>📷 Сделать скриншот текущей вкладки</button>
+            <img data-shot-preview alt="Предпросмотр скриншота задания" style="display:none;width:100%;max-height:260px;object-fit:contain;border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc">
+            <label style="font-size:12px;font-weight:700;color:#334155" for="dvfu-shot-prompt-v190">Инструкция для GPT-6 Luna — можно изменить</label>
+            <textarea id="dvfu-shot-prompt-v190" data-shot-prompt>Реши задание по изображению. Внимательно прочитай весь текст, таблицы, схемы и подписи. Если часть изображения нечитаема или данных недостаточно, укажи это и не выдумывай ответ. Верни строго JSON с ключами: {"task_type":"radio|checkbox|matching|ordering|table|diagram|short_answer|other","answer_key":{"1":"ответ для первой позиции","2":"ответ для второй позиции"},"short_answer":"краткий ответ, если задание не нумерованное","reason":"одно короткое объяснение","confidence":0.0}. Для Radio используй answer_key {"selected":"точный текст варианта"}; для Checkbox — {"selected":["точный вариант 1","точный вариант 2"]}; для сопоставления и последовательности используй ключи "1", "2", "3" в требуемом порядке. Не повторяй вопрос. Не добавляй Markdown и текст вне JSON.</textarea>
+            <div class="dvfu-shot-row">
+                <button type="button" class="dvfu-shot-primary" data-shot-send disabled>Отправить изображение GPT-6 Luna</button>
+                <button type="button" data-shot-clear>Очистить</button>
+            </div>
+            <label style="font-size:12px;font-weight:700;color:#334155" for="dvfu-shot-result-v190">Ответ и краткое объяснение</label>
+            <textarea id="dvfu-shot-result-v190" data-shot-result readonly spellcheck="false" placeholder="Здесь появится ответ обычным языком…"></textarea>
+            <button type="button" data-shot-copy disabled>Копировать ответ</button>
+            <div data-shot-status style="font-size:12px;color:#64748b">Скриншот ещё не сделан. Изображение будет отправлено только GPT-6 Luna.</div>
+        `;
+        document.body.appendChild(screenshotPanel);
+
+        screenshotPreview = screenshotPanel.querySelector('[data-shot-preview]');
+        screenshotPromptInput = screenshotPanel.querySelector('[data-shot-prompt]');
+        screenshotResultInput = screenshotPanel.querySelector('[data-shot-result]');
+        screenshotStatus = screenshotPanel.querySelector('[data-shot-status]');
+
+        screenshotButton.addEventListener('click', () => {
+            if (busy) {
+                setStatus('⏳ Дождись завершения текущего задания', '#d97706');
+                return;
+            }
+            screenshotPanel.style.display = 'flex';
+            screenshotBusy = true;
+            screenshotStatus.textContent = 'Готов к захвату текущей вкладки.';
+        });
+
+        screenshotPanel.querySelector('[data-shot-close]').addEventListener('click', closeScreenshotPanel);
+        screenshotPanel.querySelector('[data-shot-capture]').addEventListener('click', () => {
+            captureCurrentTabScreenshot().catch(showScreenshotError);
+        });
+        screenshotPanel.querySelector('[data-shot-send]').addEventListener('click', () => {
+            sendScreenshotToLuna().catch(showScreenshotError);
+        });
+        screenshotPanel.querySelector('[data-shot-clear]').addEventListener('click', clearScreenshotSession);
+        screenshotPanel.querySelector('[data-shot-copy]').addEventListener('click', copyScreenshotResult);
+    }
+
+    function closeScreenshotPanel() {
+        screenshotRequest?.abort?.();
+        screenshotRequest = null;
+        screenshotBusy = false;
+        screenshotPanel.style.display = 'none';
+    }
+
+    function clearScreenshotSession() {
+        screenshotDataUrl = '';
+        screenshotAuditId = null;
+        screenshotPreview.removeAttribute('src');
+        screenshotPreview.style.display = 'none';
+        screenshotResultInput.value = '';
+        screenshotPanel.querySelector('[data-shot-send]').disabled = true;
+        screenshotPanel.querySelector('[data-shot-copy]').disabled = true;
+        screenshotStatus.textContent = 'Снимок и результат очищены. Сделай новый скриншот.';
+        screenshotStatus.style.color = '#64748b';
+    }
+
+    function showScreenshotError(error) {
+        const message = error?.message || String(error);
+        if (screenshotStatus) {
+            screenshotStatus.textContent = 'Ошибка: ' + message;
+            screenshotStatus.style.color = '#dc2626';
+        }
+        if (screenshotAuditId) {
+            auditEvent(screenshotAuditId, 'screenshot_solver_error', { message });
+            auditUpdate(screenshotAuditId, { status: 'vision_error', error: message });
+        }
+        console.error('[DVFU LMS v19.0] Screenshot solver:', error);
+    }
+
+    async function captureCurrentTabScreenshot() {
+        if (!navigator.mediaDevices?.getDisplayMedia) {
+            throw new Error('Браузер не поддерживает захват экрана. Используй актуальный Chrome на HTTPS.');
+        }
+
+        const captureButton = screenshotPanel.querySelector('[data-shot-capture]');
+        captureButton.disabled = true;
+        screenshotStatus.textContent = 'Открой выбор источника и выбери вкладку LMS…';
+        screenshotStatus.style.color = '#64748b';
+
+        const hiddenElements = [screenshotPanel, controlDock, screenshotButton, auditPanel, auditButton, essayPanel, essayReopenButton, button]
+            .filter(Boolean);
+        const savedVisibility = hiddenElements.map(element => ({ element, value: element.style.visibility }));
+        let stream = null;
+        let video = null;
+
+        try {
+            // Убираем элементы самого userscript из снимка, чтобы они не закрывали задание.
+            hiddenElements.forEach(element => { element.style.visibility = 'hidden'; });
+
+            stream = await navigator.mediaDevices.getDisplayMedia({
+                video: { displaySurface: 'browser', frameRate: { ideal: 1, max: 1 } },
+                audio: false,
+                preferCurrentTab: true,
+                selfBrowserSurface: 'include'
+            });
+
+            const track = stream.getVideoTracks()[0];
+            const settings = track?.getSettings?.() || {};
+            if (settings.displaySurface && settings.displaySurface !== 'browser') {
+                throw new Error('Выбран не браузер. Повтори захват и выбери «Вкладка Chrome» → вкладку LMS.');
+            }
+
+            video = document.createElement('video');
+            video.muted = true;
+            video.playsInline = true;
+            video.srcObject = stream;
+            await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error('Не удалось получить кадр с выбранной вкладки.')), 10000);
+                video.addEventListener('loadedmetadata', () => { clearTimeout(timeout); resolve(); }, { once: true });
+                video.addEventListener('error', () => { clearTimeout(timeout); reject(new Error('Ошибка декодирования видеопотока экрана.')); }, { once: true });
+            });
+            await video.play();
+            await sleep(350);
+
+            const width = video.videoWidth;
+            const height = video.videoHeight;
+            if (!width || !height) throw new Error('Браузер вернул пустой кадр.');
+
+            const maxDimension = 1920;
+            const scale = Math.min(1, maxDimension / Math.max(width, height));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(width * scale));
+            canvas.height = Math.max(1, Math.round(height * scale));
+            const context = canvas.getContext('2d');
+            if (!context) throw new Error('Не удалось создать canvas для скриншота.');
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+            screenshotDataUrl = canvas.toDataURL('image/jpeg', 0.88);
+
+            screenshotPreview.src = screenshotDataUrl;
+            screenshotPreview.style.display = 'block';
+            screenshotPanel.querySelector('[data-shot-send]').disabled = false;
+            screenshotResultInput.value = '';
+            screenshotPanel.querySelector('[data-shot-copy]').disabled = true;
+            screenshotStatus.textContent = `Скриншот готов: ${width}×${height}. Проверь, что весь вопрос и варианты видны, затем отправь GPT-6 Luna.`;
+            screenshotStatus.style.color = '#047857';
+
+            const question = getQuestionText();
+            screenshotAuditId = auditCreate({ type: 'SCREENSHOT_VISION', question: question || 'Задание, прочитанное со скриншота' });
+            auditUpdate(screenshotAuditId, {
+                status: 'screenshot_captured',
+                visionModel: REVIEW_MODEL,
+                screenshotDimensions: { width, height, sentWidth: canvas.width, sentHeight: canvas.height },
+                screenshotMimeType: 'image/jpeg'
+            });
+            auditEvent(screenshotAuditId, 'screenshot_captured', { model: REVIEW_MODEL, width, height });
+        } finally {
+            stream?.getTracks?.().forEach(track => track.stop());
+            if (video) video.srcObject = null;
+            savedVisibility.forEach(item => { item.element.style.visibility = item.value; });
+            captureButton.disabled = false;
+        }
+    }
+
+    function normalizeVisionAnswer(parsed) {
+        const rawKey = parsed.answer_key ?? parsed.answerKey ?? parsed.keys ?? parsed.answers ?? parsed.answer ?? parsed.indexes;
+        if (rawKey === undefined || rawKey === null) {
+            throw new Error('GPT-6 Luna не вернула поле answer_key. Проверь исходный ответ в журнале.');
+        }
+
+        let answerKey = rawKey;
+        if (Array.isArray(rawKey)) {
+            answerKey = Object.fromEntries(rawKey.map((value, index) => [String(index + 1), value]));
+        } else if (typeof rawKey !== 'object') {
+            answerKey = { answer: String(rawKey) };
+        }
+
+        const confidenceNumber = Number(parsed.confidence);
+        return {
+            task_type: String(parsed.task_type || parsed.type || 'other'),
+            answer_key: answerKey,
+            short_answer: String(parsed.short_answer ?? parsed.shortAnswer ?? ''),
+            reason: String(parsed.reason ?? parsed.explanation ?? '').replace(/\s+/g, ' ').trim(),
+            confidence: Number.isFinite(confidenceNumber) ? Math.max(0, Math.min(1, confidenceNumber)) : null
+        };
+    }
+
+    function formatVisionAnswer(answer) {
+        const typeLabels = {
+            radio: 'Один вариант ответа',
+            checkbox: 'Несколько вариантов ответа',
+            matching: 'Сопоставление',
+            ordering: 'Последовательность',
+            table: 'Работа с таблицей',
+            diagram: 'Работа со схемой',
+            short_answer: 'Краткий ответ',
+            other: 'Анализ задания'
+        };
+        const lines = [];
+        const key = answer?.answer_key && typeof answer.answer_key === 'object'
+            ? answer.answer_key
+            : {};
+        const selected = key.selected;
+
+        lines.push(`Тип задания: ${typeLabels[answer.task_type] || answer.task_type || 'Анализ задания'}`);
+        lines.push('');
+
+        if (Array.isArray(selected)) {
+            lines.push('Ответы:');
+            selected.forEach((value, index) => lines.push(`${index + 1}. ${String(value)}`));
+        } else if (selected !== undefined && selected !== null && selected !== '') {
+            lines.push(`Ответ: ${String(selected)}`);
+        } else {
+            const entries = Object.entries(key)
+                .filter(([name, value]) => name !== 'selected' && value !== undefined && value !== null && value !== '')
+                .sort((a, b) => {
+                    const an = Number(a[0]), bn = Number(b[0]);
+                    return Number.isFinite(an) && Number.isFinite(bn) ? an - bn : a[0].localeCompare(b[0]);
+                });
+            if (entries.length) {
+                lines.push('Ответ:');
+                entries.forEach(([name, value]) => lines.push(`${/^\d+$/.test(name) ? name + '.' : name + ':'} ${String(value)}`));
+            }
+        }
+
+        if (answer.short_answer) {
+            if (lines.length > 2) lines.push('');
+            lines.push(`Краткий ответ: ${answer.short_answer}`);
+        }
+        if (answer.reason) {
+            lines.push('');
+            lines.push(`Почему: ${answer.reason}`);
+        }
+        if (answer.confidence !== null && answer.confidence !== undefined) {
+            lines.push('');
+            lines.push(`Самооценка уверенности модели: ${Math.round(answer.confidence * 100)}% (не гарантия правильности).`);
+        }
+        if (lines.length <= 2) lines.push('Модель не смогла сформировать понятный ответ. Проверь задание и журнал.');
+        return lines.join('\n').trim();
+    }
+
+    async function sendScreenshotToLuna() {
+        if (!screenshotDataUrl) throw new Error('Сначала сделай скриншот задания.');
+        if (!API_KEY || API_KEY === 'ВСТАВЬ_НОВЫЙ_API_КЛЮЧ') throw new Error('Не указан API-ключ TokenWave.');
+
+        const sendButton = screenshotPanel.querySelector('[data-shot-send]');
+        const copyButton = screenshotPanel.querySelector('[data-shot-copy]');
+        sendButton.disabled = true;
+        copyButton.disabled = true;
+        screenshotStatus.textContent = 'Отправляю изображение только GPT-6 Luna…';
+        screenshotStatus.style.color = '#64748b';
+
+        const token = generation;
+        const pageQuestion = getQuestionText();
+        const customInstruction = String(screenshotPromptInput.value || '').trim();
+        const prompt = [
+            'Проанализируй приложенный скриншот учебного задания. Изображение является главным источником информации. Прочитай точные формулировки, подписи, варианты, таблицы и схемы.',
+            pageQuestion ? `Текст вопроса, отдельно считанный со страницы (используй только как дополнительный контекст): ${pageQuestion}` : '',
+            customInstruction,
+            'Верни строго один валидный JSON без Markdown и текста вокруг. Структура: {"task_type":"radio|checkbox|matching|ordering|table|diagram|short_answer|other","answer_key":{"1":"ответ для первой позиции","2":"ответ для второй позиции"},"short_answer":"краткий ответ для ненумерованного задания","reason":"одно короткое объяснение","confidence":0.0}. Для Radio используй answer_key {"selected":"точный текст варианта"}; для Checkbox — {"selected":["точный вариант 1","точный вариант 2"]}; для Match и порядка — ключи "1", "2", "3" в порядке строк/позиций. Если часть скриншота нечитаема, не угадывай: укажи это в reason и понизь confidence. Не повторяй вопрос.'
+        ].filter(Boolean).join('\n\n');
+
+        const auditId = screenshotAuditId || auditCreate({ type: 'SCREENSHOT_VISION', question: pageQuestion || 'Задание по изображению' });
+        screenshotAuditId = auditId;
+        auditEvent(auditId, 'vision_request_started', { model: REVIEW_MODEL, promptLength: prompt.length });
+
+        try {
+            const raw = await requestVisionModel(REVIEW_MODEL, prompt, screenshotDataUrl, token);
+            if (token !== generation) throw new Error('Страница изменилась во время анализа скриншота.');
+
+            let normalized;
+            try {
+                normalized = normalizeVisionAnswer(parseJSON(raw));
+            } catch (parseError) {
+                auditUpdate(auditId, { status: 'vision_invalid_json', visionRawResponse: raw, error: parseError.message });
+                screenshotResultInput.value = 'Не удалось разобрать ответ модели в понятный формат. Подробности сохранены в журнале аудита.';
+                copyButton.disabled = true;
+                throw new Error(`${parseError.message} Исходный ответ сохранён в журнале аудита.`);
+            }
+
+            const output = formatVisionAnswer(normalized);
+            screenshotResultInput.value = output;
+            copyButton.disabled = false;
+            auditUpdate(auditId, {
+                status: 'vision_answer_ready',
+                visionModel: REVIEW_MODEL,
+                visionRawResponse: raw,
+                visionAnswer: normalized
+            });
+            auditEvent(auditId, 'vision_answer_received', { model: REVIEW_MODEL, taskType: normalized.task_type, confidence: normalized.confidence });
+            screenshotStatus.textContent = `GPT-6 Luna подготовила ответ. Тип: ${normalized.task_type}. ${normalized.confidence === null ? '' : `Оценка уверенности: ${Math.round(normalized.confidence * 100)}%.`} Проверь ответ перед использованием.`;
+            screenshotStatus.style.color = '#047857';
+        } catch (error) {
+            const message = error?.message || String(error);
+            if (/image|vision|multimodal|unsupported|not support/i.test(message)) {
+                throw new Error(`TokenWave отклонил изображение для ${REVIEW_MODEL}. Возможно, эта модель или шлюз не поддерживает vision: ${message}`);
+            }
+            throw error;
+        } finally {
+            sendButton.disabled = !screenshotDataUrl;
+        }
+    }
+
+    async function copyScreenshotResult() {
+        const value = String(screenshotResultInput?.value || '').trim();
+        if (!value) return;
+        try {
+            await navigator.clipboard.writeText(value);
+        } catch (_) {
+            screenshotResultInput.focus();
+            screenshotResultInput.select();
+            document.execCommand('copy');
+        }
+        screenshotStatus.textContent = 'Ответ скопирован в буфер обмена.';
+        screenshotStatus.style.color = '#047857';
+    }
+
+    // =====================================
+    // 3. API
+    // =====================================
+
+    function requestModel(model, prompt, token, responseFormat = 'json', allowStopped = false) {
+        const effectivePrompt = appendAttachmentContext(prompt);
+        return new Promise((resolve, reject) => {
+            let finished = false;
+
+            function finish(callback, value) {
+                if (finished) return;
+
+                finished = true;
+                activeRequest = null;
+                callback(value);
+            }
+
+            const request = GM_xmlhttpRequest({
+                method: 'POST',
+                url: API_URL,
+
+                headers: {
+                    'Authorization': `Bearer ${API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+
+                data: JSON.stringify({
+                    model,
+                    messages: [
+                        {
+                            role: 'system',
+                            content: responseFormat === 'text'
+                                ? 'Подготовь короткий и ясный черновик ответа по существу. Не повторяй и не переформулируй вопрос во вступлении. Первое предложение должно сразу содержать ответ. Не добавляй заголовок, вступление, вывод ради объёма, Markdown или пояснения о своей работе.'
+                                : 'Ты решаешь учебные задания. Верни строго один валидный JSON без Markdown и текста вокруг него. Не повторяй вопрос и не пересказывай условие. Поле reason — одно короткое предложение, максимум 15 слов.'
+                        },
+                        {
+                            role: 'user',
+                            content: effectivePrompt
+                        }
+                    ],
+                    temperature: responseFormat === 'text' ? 0.45 : 0.1
+                }),
+
+                timeout: CONFIG.timeout,
+
+                onload: response => {
+                    try {
+                        const data = JSON.parse(
+                            response.responseText || '{}'
+                        );
+
+                        if (
+                            response.status >= 200 &&
+                            response.status < 300 &&
+                            data.choices?.[0]?.message?.content
+                        ) {
+                            finish(
+                                resolve,
+                                data.choices[0].message.content
+                            );
+                        } else {
+                            const error = new Error(
+                                data.error?.message ||
+                                `HTTP ${response.status}`
+                            );
+
+                            error.status = response.status;
+
+                            finish(reject, error);
+                        }
+                    } catch (error) {
+                        finish(reject, error);
+                    }
+                },
+
+                onerror: () => finish(
+                    reject,
+                    new Error('Ошибка сети')
+                ),
+
+                ontimeout: () => finish(
+                    reject,
+                    new Error('Таймаут API')
+                ),
+
+                onabort: () => finish(
+                    reject,
+                    new Error('Запрос отменён')
+                )
+            });
+
+            activeRequest = request;
+
+            if (token !== generation || (!running && !allowStopped)) {
+                request.abort?.();
+            }
+        });
+    }
+
+    function requestVisionModel(model, prompt, imageDataUrl, token) {
+        const imageDataUrls = Array.isArray(imageDataUrl) ? imageDataUrl : [imageDataUrl];
+        return new Promise((resolve, reject) => {
+            let finished = false;
+
+            function finish(callback, value) {
+                if (finished) return;
+                finished = true;
+                screenshotRequest = null;
+                callback(value);
+            }
+
+            const request = GM_xmlhttpRequest({
+                method: 'POST',
+                url: API_URL,
+                headers: {
+                    'Authorization': `Bearer ${API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                data: JSON.stringify({
+                    model,
+                    messages: [
+                        {
+                            role: 'system',
+                            content: 'Ты анализируешь изображения и вложения к заданиям. Верни строго требуемый JSON. Не добавляй Markdown и текст вне JSON. Не выдумывай нечитаемые детали. Не определяй личность реального человека по внешности на фотографии; можно переписать видимые подписи и текст.'
+                        },
+                        {
+                            role: 'user',
+                            content: [
+                                { type: 'text', text: prompt },
+                                ...imageDataUrls.map(url => ({ type: 'image_url', image_url: { url, detail: 'high' } }))
+                            ]
+                        }
+                    ],
+                    temperature: 0.1
+                }),
+                timeout: 90000,
+                onload: response => {
+                    try {
+                        const data = JSON.parse(response.responseText || '{}');
+                        const content = data.choices?.[0]?.message?.content;
+                        const textContent = typeof content === 'string'
+                            ? content
+                            : Array.isArray(content)
+                                ? content.map(part => typeof part === 'string' ? part : (part?.text || '')).filter(Boolean).join('\n')
+                                : '';
+
+                        if (response.status >= 200 && response.status < 300 && textContent) {
+                            finish(resolve, textContent);
+                        } else {
+                            const error = new Error(data.error?.message || `HTTP ${response.status}: пустой ответ модели`);
+                            error.status = response.status;
+                            finish(reject, error);
+                        }
+                    } catch (error) {
+                        finish(reject, error);
+                    }
+                },
+                onerror: () => finish(reject, new Error('Ошибка сети при отправке изображения.')),
+                ontimeout: () => finish(reject, new Error('Таймаут анализа изображения (90 секунд).')),
+                onabort: () => finish(reject, new Error('Анализ изображения отменён.'))
+            });
+
+            screenshotRequest = request;
+            if (token !== generation) request.abort?.();
+        });
+    }
+
+    async function askAI(prompt, token, responseFormat = 'json', allowStopped = false) {
+        if (!API_KEY || API_KEY === 'ВСТАВЬ_НОВЫЙ_API_КЛЮЧ') {
+            throw new Error('Не указан новый API-ключ');
+        }
+
+        const ensureCurrent = () => {
+            if (token !== generation || (!allowStopped && !running)) {
+                throw new Error('Запрос отменён или страница изменилась');
+            }
+        };
+
+        let lastError = '';
+
+        for (const model of MODELS) {
+            ensureCurrent();
+
+            try {
+                const answer = await requestModel(
+                    model,
+                    prompt,
+                    token,
+                    responseFormat,
+                    allowStopped
+                );
+
+                ensureCurrent();
+                lastUsedModel = model;
+                return answer;
+
+            } catch (error) {
+                ensureCurrent();
+
+                if ([401, 403].includes(error.status)) {
+                    throw new Error('Ошибка API-ключа');
+                }
+
+                lastError = error.message;
+                console.warn('[DVFU LMS] Модель недоступна:', model, lastError);
+            }
+        }
+
+        throw new Error(lastError || 'Ошибка API');
+    }
+
+    // Две модели получают один и тот же исходный запрос независимо.
+    // Ответ первой модели никогда не добавляется в запрос второй.
+    async function askDualAI(prompt, token, responseFormat = 'json', onResult = null) {
+        if (!API_KEY || API_KEY === 'ВСТАВЬ_НОВЫЙ_API_КЛЮЧ') {
+            throw new Error('Не указан API-ключ TokenWave');
+        }
+
+        const results = [];
+        const models = [...new Set([PRIMARY_MODEL, REVIEW_MODEL].filter(Boolean))];
+        const ensureCurrent = () => {
+            if (token !== generation || !running) {
+                throw new Error('Запрос отменён или страница изменилась');
+            }
+        };
+
+        for (const model of models) {
+            ensureCurrent();
+            try {
+                const raw = await requestModel(model, prompt, token, responseFormat, false);
+                ensureCurrent();
+                lastUsedModel = model;
+                const result = { model, raw };
+                results.push(result);
+                if (typeof onResult === 'function') onResult(result, results.slice());
+            } catch (error) {
+                const label = model === PRIMARY_MODEL ? 'GPT-6 Sol' : 'GPT-6 Luna';
+                const wrapped = new Error(`${label} недоступна: ${error.message || error}`);
+                wrapped.model = model;
+                wrapped.status = error.status;
+                throw wrapped;
+            }
+        }
+
+        return results;
+    }
+
+    // GPT-6 Astra вызывается при расхождении или низкой уверенности GPT-6 Sol и GPT-6 Luna.
+    async function askJudge(prompt, token) {
+        if (!API_KEY || API_KEY === 'ВСТАВЬ_НОВЫЙ_API_КЛЮЧ') {
+            throw new Error('Не указан API-ключ TokenWave');
+        }
+        check(token);
+        const raw = await requestModel(JUDGE_MODEL, prompt, token, 'json', false);
+        check(token);
+        lastUsedModel = JUDGE_MODEL;
+        return raw;
+    }
+
+    function buildJudgePrompt({ question, type, options, slots, cards, results, multiple }) {
+        const taskData = options
+            ? `ВАРИАНТЫ ОТВЕТА:\n${options.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\n${multiple ? 'Выбери все правильные варианты.' : 'Выбери ровно один правильный вариант.'}`
+            : `ПОЗИЦИИ СЛЕВА:\n${slots.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\nКАРТОЧКИ СПРАВА:\n${cards.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\nДля каждой позиции выбери одну уникальную карточку. Верни номера карточек в порядке позиций слева.`;
+        const candidateData = results.map(item =>
+            `${modelLabel(item.model)} предложила номера: ${item.indexes.join(', ')}. Самооценка уверенности: ${Number.isFinite(item.confidence) ? Math.round(item.confidence * 100) + '%' : 'не указана'}. Обоснование: ${item.reason || 'не указано'}`
+        ).join('\n');
+
+        return `Ты GPT-6 Astra — независимый эксперт-арбитр. Твоя задача — определить наиболее правильный ответ по самому вопросу и исходным вариантам.\n\nСначала реши задачу самостоятельно. Не голосуй за большинство и не копируй автоматически ответ какой-либо модели. Предыдущие ответы приведены только как информация о разногласии; перепроверь их по фактам и условию. Если один из вариантов явно верен, выбери его. Если вопрос неоднозначен или данных недостаточно, не притворяйся уверенным: верни пустой массив и низкую уверенность.\n\nТИП ЗАДАНИЯ: ${type}\nВОПРОС: ${question}\n\n${taskData}\n\nОТВЕТЫ ДВУХ ПРЕДЫДУЩИХ МОДЕЛЕЙ:\n${candidateData}\n\nВерни строго один JSON без Markdown и любого текста вокруг: {"indexes":[1],"confidence":0.0,"reason":"краткое основание до 20 слов"}.\nНумерация начинается с 1. Для Radio — ровно один номер; для Checkbox — все правильные номера без лишних; для Match — ровно ${slots?.length || 1} уникальных номеров карточек в порядке позиций. confidence — число от 0 до 1, оценивающее твою уверенность; не завышай его при недостатке фактов. Не повторяй вопрос. Не описывай цепочку рассуждений.`;
+    }
+
+    async function runDisagreementJudge({ question, type, options, slots, cards, results, multiple, token, auditId, validate, displayText }) {
+        status('⚖️ Разногласие — проверяет третий арбитр...', '#7c3aed');
+        auditEvent(auditId, 'judge_started', { model: JUDGE_MODEL, type });
+        try {
+            const prompt = buildJudgePrompt({ question, type, options, slots, cards, results, multiple });
+            const raw = await askJudge(prompt, token);
+            const parsed = parseJSON(raw);
+            const indexes = Array.isArray(parsed.indexes) ? parsed.indexes.map(Number) : [];
+            const confidenceValue = readModelConfidence(parsed.confidence);
+            const confidence = confidenceValue === null ? 0 : confidenceValue;
+            const valid = validate(indexes);
+            const judgeResult = {
+                model: JUDGE_MODEL,
+                raw,
+                indexes,
+                confidence,
+                valid,
+                reason: String(parsed.reason || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+                displayText: valid ? displayText(indexes) : 'Арбитр не смог подтвердить корректный набор ответов'
+            };
+
+            auditUpdate(auditId, {
+                judgeModel: JUDGE_MODEL,
+                judgeResult: {
+                    indexes: judgeResult.indexes,
+                    confidence: judgeResult.confidence,
+                    reason: judgeResult.reason,
+                    valid: judgeResult.valid,
+                    rawResponse: judgeResult.raw
+                }
+            });
+            auditEvent(auditId, 'judge_result', {
+                model: JUDGE_MODEL,
+                indexes,
+                confidence,
+                valid,
+                autoAccepted: valid && confidence >= JUDGE_CONFIDENCE_THRESHOLD
+            });
+
+            return {
+                result: judgeResult,
+                accepted: valid && confidence >= JUDGE_CONFIDENCE_THRESHOLD
+            };
+        } catch (error) {
+            if (token !== generation || !running) throw error;
+            auditUpdate(auditId, { judgeError: error?.message || String(error) });
+            auditEvent(auditId, 'judge_unavailable', { model: JUDGE_MODEL, message: error?.message || String(error) });
+            console.warn('[DVFU LMS] GPT-6 Astra недоступен:', error);
+            return { result: null, accepted: false, error };
+        }
+    }
+
+    function parseJSON(raw) {
+        const clean = String(raw)
+            .replace(/<think>[\s\S]*?<\/think>/gi, '')
+            .replace(/```json|```/gi, '')
+            .trim();
+
+        const start = clean.indexOf('{');
+        const end = clean.lastIndexOf('}');
+
+        if (start < 0 || end <= start) {
+            throw new Error('Модель вернула неправильный JSON');
+        }
+
+        return JSON.parse(clean.slice(start, end + 1));
+    }
+
+    function readModelConfidence(value) {
+        if (value === undefined || value === null || value === '') return null;
+        const number = Number(value);
+        return Number.isFinite(number) ? Math.max(0, Math.min(1, number)) : null;
+    }
+
+    function hasLowConfidence(results) {
+        return !Array.isArray(results) || results.some(item =>
+            !Number.isFinite(item.confidence) || item.confidence < JUDGE_CONFIDENCE_THRESHOLD
+        );
+    }
+
+    function modelLabel(model) {
+        if (model === PRIMARY_MODEL) return 'GPT-6 Sol';
+        if (model === REVIEW_MODEL) return 'GPT-6 Luna';
+        if (model === JUDGE_MODEL) return 'GPT-6 Astra — арбитр';
+        return model;
+    }
+
+    function showModelDecision({ question, type, results, confirmLabel = 'Выбрать и отправить ответ' }) {
+        return new Promise(resolve => {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;z-index:10000020;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(15,23,42,.62);box-sizing:border-box';
+
+            const panel = document.createElement('section');
+            panel.setAttribute('role', 'dialog');
+            panel.setAttribute('aria-modal', 'true');
+            panel.setAttribute('aria-label', 'Выбор ответа между моделями и арбитром');
+            panel.style.cssText = 'width:min(980px,100%);max-height:92vh;display:flex;flex-direction:column;gap:12px;padding:18px;box-sizing:border-box;overflow:auto;background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:16px;box-shadow:0 18px 60px rgba(0,0,0,.35);font:14px/1.45 Arial,sans-serif';
+
+            const heading = document.createElement('div');
+            heading.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px';
+            const title = document.createElement('strong');
+            title.textContent = results.some(item => item.model === JUDGE_MODEL)
+                ? 'Арбитр не уверен — выбери ответ вручную'
+                : results.length === 1
+                    ? 'Только одна модель вернула допустимый ответ'
+                    : 'Модели выбрали разные ответы';
+            title.style.fontSize = '18px';
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.textContent = '×';
+            close.title = 'Закрыть без отправки';
+            close.style.cssText = 'border:0;background:transparent;color:#64748b;font-size:26px;cursor:pointer';
+            heading.append(title, close);
+
+            const kind = document.createElement('div');
+            kind.textContent = /развёрнутый ответ/i.test(type) ? 'Выбери черновик. После подтверждения он откроется в редакторе; автоматической отправки не будет.' : `Тип задания: ${type}. Выбери один вариант. После подтверждения скрипт применит выбранный ответ и отправит его в LMS.`;
+            kind.style.cssText = 'color:#64748b;font-size:12px';
+
+            const questionBox = document.createElement('div');
+            questionBox.textContent = question || 'Текст вопроса не найден';
+            questionBox.style.cssText = 'padding:10px 12px;border-radius:9px;background:#f1f5f9;color:#172033;max-height:100px;overflow:auto';
+
+            const cards = document.createElement('div');
+            cards.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:12px;align-items:stretch;min-width:0;width:100%;box-sizing:border-box';
+
+            let selected = null;
+            const chooseButtons = [];
+
+            results.forEach(result => {
+                const card = document.createElement('div');
+                card.style.cssText = 'min-width:0;max-width:100%;display:flex;flex-direction:column;gap:9px;padding:12px;border:1px solid #cbd5e1;border-radius:12px;background:#fff;box-sizing:border-box;overflow:hidden';
+                const modelTitle = document.createElement('strong');
+                modelTitle.textContent = modelLabel(result.model);
+                const answer = document.createElement('pre');
+                answer.textContent = result.displayText || result.raw || '';
+                answer.style.cssText = 'margin:0;white-space:pre-wrap;overflow-wrap:anywhere;max-height:36vh;overflow:auto;padding:10px;border-radius:8px;background:#f8fafc;color:#172033;font:13px/1.5 Arial,sans-serif';
+                card.append(modelTitle, answer);
+
+                if (Number.isFinite(Number(result.confidence))) {
+                    const confidence = document.createElement('div');
+                    confidence.textContent = `Самооценка ${modelLabel(result.model)}: ${Math.round(Number(result.confidence) * 100)}%`;
+                    confidence.style.cssText = 'color:#7c3aed;font-size:12px;font-weight:700';
+                    card.appendChild(confidence);
+                }
+
+                if (result.reason) {
+                    const reason = document.createElement('div');
+                    reason.textContent = `Обоснование: ${result.reason}`;
+                    reason.style.cssText = 'color:#64748b;font-size:12px;max-height:90px;overflow:auto';
+                    card.appendChild(reason);
+                }
+
+                const choose = document.createElement('button');
+                choose.type = 'button';
+                choose.textContent = `Выбрать ${modelLabel(result.model)}`;
+                choose.style.cssText = 'appearance:none;position:static;display:flex;align-items:center;justify-content:center;width:100%;min-width:0;max-width:100%;min-height:42px;box-sizing:border-box;margin:0;padding:10px;border:1px solid #94a3b8;border-radius:8px;background:#fff;color:#172033;font:700 13px/1.35 Arial,sans-serif;white-space:normal;overflow-wrap:anywhere;text-align:center;cursor:pointer';
+                choose.addEventListener('click', () => {
+                    selected = result;
+                    chooseButtons.forEach(button => {
+                        button.style.background = button === choose ? '#dbeafe' : '#fff';
+                        button.style.borderColor = button === choose ? '#2563eb' : '#94a3b8';
+                    });
+                    confirm.disabled = false;
+                    confirm.style.opacity = '1';
+                });
+                chooseButtons.push(choose);
+                card.appendChild(choose);
+                cards.appendChild(card);
+            });
+
+            const footer = document.createElement('div');
+            footer.style.cssText = 'display:flex;justify-content:flex-end;align-items:stretch;gap:8px;flex-wrap:wrap;min-width:0';
+            const cancel = document.createElement('button');
+            cancel.type = 'button';
+            cancel.textContent = 'Отмена — не отправлять';
+            cancel.style.cssText = 'appearance:none;position:static;display:flex;align-items:center;justify-content:center;min-width:0;max-width:100%;box-sizing:border-box;margin:0;padding:11px 14px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;color:#334155;font:600 13px/1.35 Arial,sans-serif;white-space:normal;cursor:pointer';
+            const confirm = document.createElement('button');
+            confirm.type = 'button';
+            confirm.textContent = confirmLabel;
+            confirm.disabled = true;
+            confirm.style.cssText = 'appearance:none;position:static;display:flex;align-items:center;justify-content:center;min-width:0;max-width:100%;box-sizing:border-box;margin:0;padding:11px 14px;border:0;border-radius:9px;background:#2563eb;color:#fff;font:700 13px/1.35 Arial,sans-serif;white-space:normal;cursor:pointer;opacity:.45';
+            footer.append(cancel, confirm);
+            panel.append(heading, kind, questionBox, cards, footer);
+            overlay.appendChild(panel);
+            document.body.appendChild(overlay);
+
+            let settled = false;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                overlay.remove();
+                resolve(value);
+            };
+            close.addEventListener('click', () => finish(null));
+            cancel.addEventListener('click', () => finish(null));
+            confirm.addEventListener('click', () => {
+                if (selected) finish(selected);
+            });
+            overlay.addEventListener('click', event => {
+                if (event.target === overlay) finish(null);
+            });
+        });
+    }
+
+    function sameIndexResult(a, b, unordered = false) {
+        if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+        const left = unordered ? a.map(Number).sort((x, y) => x - y) : a.map(Number);
+        const right = unordered ? b.map(Number).sort((x, y) => x - y) : b.map(Number);
+        return left.every((value, index) => value === right[index]);
+    }
+
+    // =====================================
+    // 4. MATCH — ПОЗИЦИИ И КАРТОЧКИ
+    // =====================================
+
+    function getAllSlots() {
+        return Array.from(
+            document.querySelectorAll('.drag-answer')
+        ).filter(visible);
+    }
+
+    function isSlotFilled(row) {
+    const place = row.querySelector('.drag-answer__place');
+
+    if (!place) return false;
+
+    // Ищем карточку на любой глубине вложенности
+    return !!place.querySelector('.drag-item');
+}
+
+    function getEmptySlots() {
+        return getAllSlots().filter(row =>
+            !isSlotFilled(row)
+        );
+    }
+
+    function getSlotTitle(row, index = 0) {
+    const title = row.querySelector(
+        '.drag-answer__title'
+    );
+
+    const value = getText(title);
+
+    if (value) return value;
+
+    // Для заданий с нумерованными позициями
+    const allRows = getAllSlots();
+    const position = allRows.indexOf(row);
+
+    return `Позиция ${position >= 0 ? position + 1 : index + 1}`;
+}
+
+    function getRightCards() {
+    return Array.from(
+        document.querySelectorAll('.drag-items .drag-item')
+    ).filter(el => {
+        return visible(el) &&
+            getText(el).length > 0 &&
+            !el.closest('.drag-answer__place');
+    });
+}
+
+    // =====================================
+    // 5. RADIO / CHECKBOX
+    // =====================================
+
+   function getChoiceOptions() {
+    const inputs = Array.from(
+        document.querySelectorAll(
+            'input[type="radio"], input[type="checkbox"]'
+        )
+    );
+
+    return inputs.map(input => {
+
+        // Ищем видимую оболочку, а не скрытый input.
+        const wrapper = input.closest(
+            '.radio__label-wrapper, .checkbox__label-wrapper'
+        ) || input.closest('label') ||
+            input.parentElement?.parentElement ||
+            input.parentElement;
+
+        if (
+            !wrapper ||
+            !visible(wrapper) ||
+            input.disabled
+        ) {
+            return null;
+        }
+
+        const title = wrapper.querySelector(
+            '.radio__title, .checkbox__title'
+        );
+
+        return {
+            input: input,
+            wrapper: wrapper,
+            text: getText(title || wrapper),
+            type: input.type,
+            checked: input.checked
+        };
+
+    }).filter(option =>
+        option && option.text.length > 0
+    );
+}
+
+
+    // =====================================
+    // 6. ТЕКСТ ВОПРОСА
+    // =====================================
+
+    function cleanQuestionText(value) {
+        return String(value || '')
+            .replace(/\u00a0/g, ' ')
+            .replace(/[\t\r\n]+/g, ' ')
+            .replace(/\s{2,}/g, ' ')
+            .replace(/^\s*ВОПРОС\s+\d+\s+ИЗ\s+\d+\s*/i, '')
+            .trim();
+    }
+
+    function getQuestionInfo() {
+        // На текущей версии LMS реальный текст вопроса находится здесь:
+        // .test__header > .editor-wrapper > .editor-paragraph
+        const header = Array.from(
+            document.querySelectorAll('.test__header')
+        ).find(visible);
+
+        if (header) {
+            const headerText = getText(header);
+            const numberMatch = headerText.match(/ВОПРОС\s+(\d+)\s+ИЗ\s+(\d+)/i);
+            const paragraphs = Array.from(
+                header.querySelectorAll('.editor-paragraph')
+            ).filter(visible);
+
+            let text = paragraphs
+                .map(getText)
+                .filter(Boolean)
+                .join(' ');
+            let source = '.test__header .editor-paragraph';
+
+            if (!text || text.length < 6) {
+                const editor = Array.from(
+                    header.querySelectorAll('.editor-wrapper')
+                ).find(visible);
+                text = getText(editor || header);
+                source = editor ? '.test__header .editor-wrapper' : '.test__header';
+            }
+
+            text = cleanQuestionText(text);
+            if (text.length >= 6) {
+                return {
+                    text,
+                    source,
+                    number: numberMatch ? Number(numberMatch[1]) : null,
+                    total: numberMatch ? Number(numberMatch[2]) : null
+                };
+            }
+        }
+
+        // Запасные селекторы для возможных вариантов вёрстки.
+        // Намеренно НЕ читаем document.body: это добавляло список всего теста,
+        // iframe аналитики, кнопки и прочие посторонние элементы.
+        const fallbackSelectors = [
+            '.test__question-title',
+            '.test__question-text',
+            '.question__title',
+            '.question__text',
+            '.test__question',
+            '#course-player .editor-paragraph'
+        ];
+
+        for (const selector of fallbackSelectors) {
+            const candidates = Array.from(
+                document.querySelectorAll(selector)
+            ).filter(visible);
+
+            for (const element of candidates) {
+                const text = cleanQuestionText(getText(element));
+                if (text.length >= 6 && text.length <= 2000) {
+                    return {
+                        text,
+                        source: selector,
+                        number: null,
+                        total: null
+                    };
+                }
+            }
+        }
+
+        return {
+            text: '',
+            source: 'not_found',
+            number: null,
+            total: null
+        };
+    }
+
+    function getQuestionText() {
+        return getQuestionInfo().text;
+    }
+
+    // Ищем только явно помеченные LMS-вложения, не произвольные ссылки страницы.
+    function getQuestionAttachments() {
+        const seen = new Set();
+        return Array.from(document.querySelectorAll('a.attachment[href]'))
+            .filter(anchor => visible(anchor) && !anchor.closest('#dvfu-screenshot-panel-v190, #dvfu-audit-panel-v190, #dvfu-essay-panel-v190'))
+            .map(anchor => {
+                try {
+                    const url = new URL(anchor.getAttribute('href'), location.href);
+                    const filename = getText(anchor) || decodeURIComponent(url.pathname.split('/').pop() || 'attachment');
+                    const extensionMatch = filename.match(/\.([a-z0-9]+)$/i) || url.pathname.match(/\.([a-z0-9]+)$/i);
+                    const extension = extensionMatch ? extensionMatch[1].toLowerCase() : '';
+                    return { filename, url: url.href, extension, hostname: url.hostname };
+                } catch (_) {
+                    return null;
+                }
+            })
+            .filter(item => {
+                if (!item || seen.has(item.url)) return false;
+                seen.add(item.url);
+                return true;
+            });
+    }
+
+    function arrayBufferToBase64(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        const chunkSize = 0x8000;
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+            binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)));
+        }
+        return btoa(binary);
+    }
+
+    function arrayBufferToDataUrl(buffer, mimeType) {
+        return `data:${mimeType};base64,${arrayBufferToBase64(buffer)}`;
+    }
+
+    function downloadAttachment(meta) {
+        return new Promise((resolve, reject) => {
+            if (meta.hostname !== 'files.teachbase.ru') {
+                reject(new Error(`Неожиданный домен вложения: ${meta.hostname}. Разрешён только files.teachbase.ru.`));
+                return;
+            }
+            if (!/^https:$/.test(new URL(meta.url).protocol)) {
+                reject(new Error('Вложение должно загружаться по HTTPS.'));
+                return;
+            }
+            const request = GM_xmlhttpRequest({
+                method: 'GET',
+                url: meta.url,
+                responseType: 'arraybuffer',
+                timeout: 60000,
+                onload: response => {
+                    attachmentDownloadRequest = null;
+                    if (response.status < 200 || response.status >= 300) {
+                        reject(new Error(`Не удалось скачать ${meta.filename}: HTTP ${response.status}.`));
+                        return;
+                    }
+                    let buffer = response.response;
+                    if (!(buffer instanceof ArrayBuffer)) {
+                        if (response.responseText) {
+                            const encoded = new TextEncoder().encode(response.responseText);
+                            buffer = encoded.buffer;
+                        } else {
+                            reject(new Error(`Пустой файл: ${meta.filename}.`));
+                            return;
+                        }
+                    }
+                    if (!buffer.byteLength) {
+                        reject(new Error(`Файл пустой: ${meta.filename}.`));
+                        return;
+                    }
+                    resolve({
+                        buffer,
+                        byteLength: buffer.byteLength,
+                        contentType: String(response.responseHeaders || '').match(/content-type:\s*([^;\r\n]+)/i)?.[1]?.trim().toLowerCase() || ''
+                    });
+                },
+                onerror: () => {
+                    attachmentDownloadRequest = null;
+                    reject(new Error(`Сетевая ошибка при скачивании ${meta.filename}.`));
+                },
+                ontimeout: () => {
+                    attachmentDownloadRequest = null;
+                    reject(new Error(`Таймаут скачивания ${meta.filename}.`));
+                },
+                onabort: () => {
+                    attachmentDownloadRequest = null;
+                    reject(new Error(`Скачивание ${meta.filename} отменено.`));
+                }
+            });
+            attachmentDownloadRequest = request;
+        });
+    }
+
+    function parseXmlDocument(xmlText, label) {
+        const parsed = new DOMParser().parseFromString(xmlText, 'application/xml');
+        if (parsed.getElementsByTagName('parsererror').length) {
+            throw new Error(`Не удалось разобрать XML внутри DOCX (${label}).`);
+        }
+        return parsed;
+    }
+
+    function parseZipDirectory(buffer) {
+        const view = new DataView(buffer);
+        const minOffset = Math.max(0, buffer.byteLength - 65557);
+        let eocd = -1;
+        for (let offset = buffer.byteLength - 22; offset >= minOffset; offset--) {
+            if (view.getUint32(offset, true) === 0x06054b50) {
+                eocd = offset;
+                break;
+            }
+        }
+        if (eocd < 0) throw new Error('DOCX не похож на ZIP-архив или повреждён.');
+
+        const entryCount = view.getUint16(eocd + 10, true);
+        const centralOffset = view.getUint32(eocd + 16, true);
+        if (entryCount === 0xffff || centralOffset === 0xffffffff) {
+            throw new Error('DOCX использует ZIP64; такой архив пока не поддерживается.');
+        }
+
+        const entries = new Map();
+        let offset = centralOffset;
+        const decoder = new TextDecoder('utf-8');
+        for (let i = 0; i < entryCount; i++) {
+            if (offset + 46 > buffer.byteLength || view.getUint32(offset, true) !== 0x02014b50) {
+                throw new Error('Повреждён каталог файлов внутри DOCX.');
+            }
+            const flags = view.getUint16(offset + 8, true);
+            const method = view.getUint16(offset + 10, true);
+            const compressedSize = view.getUint32(offset + 20, true);
+            const uncompressedSize = view.getUint32(offset + 24, true);
+            const nameLength = view.getUint16(offset + 28, true);
+            const extraLength = view.getUint16(offset + 30, true);
+            const commentLength = view.getUint16(offset + 32, true);
+            const localOffset = view.getUint32(offset + 42, true);
+            const nameBytes = new Uint8Array(buffer, offset + 46, nameLength);
+            const name = decoder.decode(nameBytes);
+            if (compressedSize === 0xffffffff || uncompressedSize === 0xffffffff || localOffset === 0xffffffff) {
+                throw new Error('Вложение DOCX использует ZIP64; пока не поддерживается.');
+            }
+            entries.set(name, { method, compressedSize, uncompressedSize, localOffset, flags });
+            offset += 46 + nameLength + extraLength + commentLength;
+        }
+        return { buffer, entries };
+    }
+
+    async function extractZipEntry(zip, path) {
+        const entry = zip.entries.get(path);
+        if (!entry) return null;
+        if (entry.flags & 1) throw new Error('Зашифрованные DOCX пока не поддерживаются.');
+        const view = new DataView(zip.buffer);
+        const local = entry.localOffset;
+        if (view.getUint32(local, true) !== 0x04034b50) throw new Error(`Повреждён файл ${path} внутри DOCX.`);
+        const nameLength = view.getUint16(local + 26, true);
+        const extraLength = view.getUint16(local + 28, true);
+        const dataStart = local + 30 + nameLength + extraLength;
+        const compressed = zip.buffer.slice(dataStart, dataStart + entry.compressedSize);
+
+        if (entry.method === 0) return compressed;
+        if (entry.method !== 8) throw new Error(`Метод сжатия DOCX не поддерживается: ${entry.method}.`);
+        if (typeof DecompressionStream !== 'function') {
+            throw new Error('Браузер не поддерживает распаковку DOCX. Обнови Chrome.');
+        }
+        try {
+            const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+            const result = await new Response(stream).arrayBuffer();
+            if (entry.uncompressedSize && result.byteLength !== entry.uncompressedSize) {
+                throw new Error('Размер распакованной части DOCX не совпал.');
+            }
+            return result;
+        } catch (error) {
+            throw new Error(`Не удалось распаковать ${path}: ${error.message || error}`);
+        }
+    }
+
+    function normalizeDocxTarget(target) {
+        const initial = target.startsWith('/') ? target.slice(1) : `word/${target}`;
+        const parts = [];
+        for (const part of initial.replace(/\\/g, '/').split('/')) {
+            if (!part || part === '.') continue;
+            if (part === '..') parts.pop();
+            else parts.push(part);
+        }
+        return parts.join('/');
+    }
+
+    async function parseDocxAttachment(buffer) {
+        const zip = parseZipDirectory(buffer);
+        const documentBuffer = await extractZipEntry(zip, 'word/document.xml');
+        if (!documentBuffer) throw new Error('В DOCX не найден word/document.xml.');
+        const documentXml = parseXmlDocument(new TextDecoder('utf-8').decode(documentBuffer), 'document.xml');
+        const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+        const A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+        const PKG_NS = 'http://schemas.openxmlformats.org/package/2006/relationships';
+        const textOf = node => Array.from(node.getElementsByTagNameNS(W_NS, 't')).map(item => item.textContent || '').join('');
+        const body = documentXml.getElementsByTagNameNS(W_NS, 'body')[0];
+        if (!body) throw new Error('В DOCX не найден основной текст документа.');
+
+        const lines = [];
+        for (const child of Array.from(body.children || [])) {
+            if (child.namespaceURI !== W_NS) continue;
+            if (child.localName === 'p') {
+                const value = textOf(child).trim();
+                if (value) lines.push(value);
+            } else if (child.localName === 'tbl') {
+                const rows = Array.from(child.getElementsByTagNameNS(W_NS, 'tr'));
+                for (const row of rows) {
+                    const cells = Array.from(row.children || []).filter(cell => cell.namespaceURI === W_NS && cell.localName === 'tc');
+                    const values = cells.map(cell => Array.from(cell.getElementsByTagNameNS(W_NS, 'p')).map(textOf).join(' / ').trim());
+                    if (values.some(Boolean)) lines.push(`| ${values.join(' | ')} |`);
+                }
+            }
+        }
+        if (!lines.length) {
+            // Запасной вариант для документов, где текст обёрнут в content controls.
+            const allParagraphs = Array.from(documentXml.getElementsByTagNameNS(W_NS, 'p'));
+            for (const paragraph of allParagraphs) {
+                const value = textOf(paragraph).trim();
+                if (value) lines.push(value);
+            }
+        }
+        let text = lines.join('\n').trim();
+        let textTruncated = false;
+        if (text.length > 40000) {
+            text = text.slice(0, 40000);
+            textTruncated = true;
+        }
+
+        const relBuffer = await extractZipEntry(zip, 'word/_rels/document.xml.rels');
+        const relMap = new Map();
+        if (relBuffer) {
+            const relXml = parseXmlDocument(new TextDecoder('utf-8').decode(relBuffer), 'document.xml.rels');
+            const relationships = Array.from(relXml.getElementsByTagNameNS(PKG_NS, 'Relationship'));
+            for (const rel of relationships) {
+                const type = rel.getAttribute('Type') || '';
+                const mode = rel.getAttribute('TargetMode') || '';
+                if (!type.endsWith('/image') || mode === 'External') continue;
+                const id = rel.getAttribute('Id');
+                const target = rel.getAttribute('Target');
+                if (id && target) relMap.set(id, normalizeDocxTarget(target));
+            }
+        }
+
+        const images = [];
+        const skippedImages = [];
+        const seenPaths = new Set();
+        const relIds = [];
+        const blips = Array.from(documentXml.getElementsByTagNameNS(A_NS, 'blip'));
+        for (const blip of blips) {
+            const relId = blip.getAttributeNS(R_NS, 'embed') || blip.getAttribute('r:embed');
+            if (relId) relIds.push(relId);
+        }
+        const vmlImages = Array.from(documentXml.getElementsByTagNameNS('urn:schemas-microsoft-com:vml', 'imagedata'));
+        for (const imageNode of vmlImages) {
+            const relId = imageNode.getAttributeNS(R_NS, 'id') || imageNode.getAttribute('r:id');
+            if (relId) relIds.push(relId);
+        }
+        for (const relId of relIds) {
+            const path = relMap.get(relId);
+            if (!path || seenPaths.has(path)) continue;
+            seenPaths.add(path);
+            const extension = (path.match(/\.([a-z0-9]+)$/i) || [,''])[1].toLowerCase();
+            if (!['png', 'jpg', 'jpeg'].includes(extension)) {
+                skippedImages.push(path);
+                continue;
+            }
+            if (images.length >= 6) {
+                skippedImages.push(path);
+                continue;
+            }
+            const imageBuffer = await extractZipEntry(zip, path);
+            if (!imageBuffer) {
+                skippedImages.push(path);
+                continue;
+            }
+            const mime = extension === 'png' ? 'image/png' : 'image/jpeg';
+            images.push({ path, mime, byteLength: imageBuffer.byteLength, dataUrl: arrayBufferToDataUrl(imageBuffer, mime) });
+        }
+
+        return { text, images, textTruncated, skippedImages };
+    }
+
+    function buildAttachmentQuestionContext() {
+        const parts = [`ВОПРОС LMS: ${getQuestionText() || '(текст вопроса не прочитан)'}`];
+        const options = getChoiceOptions();
+        if (options.length) parts.push(`ВАРИАНТЫ ОТВЕТА:\n${options.map((item, index) => `${index + 1}. ${item.text}`).join('\n')}`);
+        const slots = getAllSlots().map(getSlotTitle).filter(Boolean);
+        const cards = getRightCards().map(getText).filter(Boolean);
+        if (slots.length) parts.push(`ПОЗИЦИИ MATCH:\n${slots.map((item, index) => `${index + 1}. ${item}`).join('\n')}`);
+        if (cards.length) parts.push(`КАРТОЧКИ MATCH:\n${cards.map((item, index) => `${index + 1}. ${item}`).join('\n')}`);
+        return parts.join('\n\n');
+    }
+
+    function attachmentVisionSummary(parsed, raw) {
+        const summary = String(parsed.attachment_summary || parsed.summary || parsed.description || '').trim();
+        const visibleText = Array.isArray(parsed.visible_text) ? parsed.visible_text.join('\n') : String(parsed.visible_text || '');
+        const facts = Array.isArray(parsed.relevant_facts) ? parsed.relevant_facts.join('\n') : String(parsed.relevant_facts || '');
+        const uncertainties = Array.isArray(parsed.uncertainties) ? parsed.uncertainties.join('\n') : String(parsed.uncertainties || '');
+        const combined = [summary, visibleText ? `Текст на изображениях:\n${visibleText}` : '', facts ? `Наблюдаемые факты:\n${facts}` : '', uncertainties ? `Ограничения чтения:\n${uncertainties}` : ''].filter(Boolean).join('\n\n');
+        if (!combined.trim()) throw new Error(`GPT-6 Luna не смогла вернуть описание вложенного изображения. Ответ: ${String(raw).slice(0, 500)}`);
+        if (parsed.read_success === false) throw new Error(`GPT-6 Luna не смогла надёжно прочитать вложение: ${combined.slice(0, 500)}`);
+        return combined.slice(0, 12000);
+    }
+
+    function validateAttachmentSignature(buffer, extension, filename) {
+        const bytes = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 8));
+        const isPng = bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a;
+        const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+        const isZip = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && [0x03, 0x05, 0x07].includes(bytes[2]) && [0x04, 0x06, 0x08].includes(bytes[3]);
+        if (extension === 'png' && !isPng) throw new Error(`${filename}: расширение PNG не совпадает с содержимым файла.`);
+        if (['jpg', 'jpeg'].includes(extension) && !isJpeg) throw new Error(`${filename}: расширение JPG/JPEG не совпадает с содержимым файла.`);
+        if (extension === 'docx' && !isZip) throw new Error(`${filename}: DOCX не является корректным ZIP-контейнером.`);
+    }
+
+    function checkAttachmentQuestion(token, fingerprint) {
+        check(token);
+        if (getFingerprint() !== fingerprint) throw new Error('Вопрос изменился во время чтения вложения. Повтори на новом вопросе.');
+    }
+
+    async function prepareAttachmentsForQuestion(token, fingerprint) {
+        if (!API_KEY || API_KEY === 'ВСТАВЬ_НОВЫЙ_API_КЛЮЧ') throw new Error('Не указан API-ключ TokenWave. Вставь ключ в API_KEY.');
+        const attachments = getQuestionAttachments();
+        if (!attachments.length) return { context: '', metadata: [] };
+        if (attachments.length > 5) throw new Error(`Найдено ${attachments.length} вложений. Пока поддерживается не более 5 за один вопрос.`);
+
+        const metadata = [];
+        const imagePayloads = [];
+        const textParts = [];
+        const attachmentWarnings = [];
+        let totalImageBytes = 0;
+        const taskContext = buildAttachmentQuestionContext();
+
+        for (const meta of attachments) {
+            checkAttachmentQuestion(token, fingerprint);
+            if (!['png', 'jpg', 'jpeg', 'docx'].includes(meta.extension)) {
+                throw new Error(`Формат .${meta.extension || 'неизвестен'} пока не поддерживается (${meta.filename}). Поддерживаются только PNG, JPG, JPEG и DOCX.`);
+            }
+            const downloaded = await downloadAttachment(meta);
+            checkAttachmentQuestion(token, fingerprint);
+            validateAttachmentSignature(downloaded.buffer, meta.extension, meta.filename);
+            const maxFileSize = meta.extension === 'docx' ? 15 * 1024 * 1024 : 8 * 1024 * 1024;
+            if (downloaded.byteLength > maxFileSize) {
+                throw new Error(`${meta.filename} слишком большой (${(downloaded.byteLength / 1024 / 1024).toFixed(1)} МБ). Лимит: ${Math.round(maxFileSize / 1024 / 1024)} МБ.`);
+            }
+
+            if (['png', 'jpg', 'jpeg'].includes(meta.extension)) {
+                const mime = meta.extension === 'png' ? 'image/png' : 'image/jpeg';
+                totalImageBytes += downloaded.byteLength;
+                if (totalImageBytes > 8 * 1024 * 1024) throw new Error('Общий размер изображений превышает 8 МБ.');
+                imagePayloads.push({ name: meta.filename, mime, byteLength: downloaded.byteLength, dataUrl: arrayBufferToDataUrl(downloaded.buffer, mime) });
+                metadata.push({ filename: meta.filename, type: meta.extension.toUpperCase(), bytes: downloaded.byteLength, status: 'downloaded' });
+                continue;
+            }
+
+            const docx = await parseDocxAttachment(downloaded.buffer);
+            if (!docx.text && !docx.images.length) throw new Error(`В ${meta.filename} не удалось извлечь текст, таблицы или поддерживаемые изображения.`);
+            if (docx.text) {
+                textParts.push(`ДОКУМЕНТ WORD: ${meta.filename}\n${docx.text}${docx.textTruncated ? '\n[Текст обрезан после 40 000 символов.]' : ''}`);
+            }
+            for (const image of docx.images) {
+                totalImageBytes += image.byteLength;
+                if (totalImageBytes > 8 * 1024 * 1024) {
+                    throw new Error('Общий размер изображений из вложений превышает 8 МБ.');
+                }
+                imagePayloads.push({ name: `${meta.filename} → ${image.path}`, mime: image.mime, byteLength: image.byteLength, dataUrl: image.dataUrl });
+            }
+            const note = docx.skippedImages.length ? `Не переданы изображения неподдерживаемого формата/сверх лимита: ${docx.skippedImages.join(', ')}.` : '';
+            if (note) attachmentWarnings.push(`${meta.filename}: ${note}`);
+            if (docx.textTruncated) attachmentWarnings.push(`${meta.filename}: текст обрезан после 40 000 символов.`);
+            metadata.push({ filename: meta.filename, type: 'DOCX', bytes: downloaded.byteLength, textChars: docx.text.length, embeddedImages: docx.images.length, skippedImages: docx.skippedImages.length, status: 'parsed', note });
+        }
+
+        const contextParts = [];
+        if (imagePayloads.length > 8) throw new Error(`Найдено ${imagePayloads.length} изображений. Пока поддерживается не более 8 за один вопрос.`);
+        if (textParts.length) contextParts.push(`ИЗВЛЕЧЁННОЕ СОДЕРЖИМОЕ ПРИКРЕПЛЁННЫХ DOCX-ФАЙЛОВ:\n${textParts.join('\n\n---\n\n')}`);
+        if (attachmentWarnings.length) contextParts.push(`ПРЕДУПРЕЖДЕНИЯ О ЧТЕНИИ ВЛОЖЕНИЙ:\n${attachmentWarnings.join('\n')}\nНе делай выводы по отсутствующим изображениям или обрезанным фрагментам.`);
+
+        if (imagePayloads.length) {
+            status(`📎 Передаю ${imagePayloads.length} изображений GPT-6 Luna для чтения...`, '#7c3aed');
+            const visionPrompt = [
+                'Проанализируй изображения, приложенные к текущему вопросу LMS. Извлеки только наблюдаемую информацию: надписи, подписи, таблицы, схемы, предметы, визуальные детали и факты, которые помогают понять задание.',
+                taskContext,
+                textParts.length ? `ТЕКСТ ИЗ ТОГО ЖЕ WORD-ДОКУМЕНТА:\n${textParts.join('\n\n').slice(0, 18000)}` : '',
+                'Не додумывай нечитаемые фрагменты. Не определяй личность реального человека по внешности на фотографии; можно переписать видимую подпись или текст рядом с изображением. Верни строго JSON: {"read_success":true,"attachment_summary":"краткое описание содержимого","visible_text":["прочитанная надпись"],"relevant_facts":["наблюдаемый факт"],"uncertainties":["что не удалось прочитать"]}. Не решай тест вместо извлечения данных. Не добавляй Markdown.'
+            ].filter(Boolean).join('\n\n');
+            const raw = await requestVisionModel(REVIEW_MODEL, visionPrompt, imagePayloads.map(item => item.dataUrl), token);
+            checkAttachmentQuestion(token, fingerprint);
+            let parsed;
+            try { parsed = parseJSON(raw); }
+            catch (error) { throw new Error(`GPT-6 Luna вернула некорректный JSON при чтении вложения: ${error.message}`); }
+            const summary = attachmentVisionSummary(parsed, raw);
+            contextParts.push(`ВИЗУАЛЬНЫЙ АНАЛИЗ ВЛОЖЕНИЙ GPT-6 LUNA:\n${summary}`);
+            metadata.forEach(item => { if (item.type !== 'DOCX') item.status = 'downloaded_and_analyzed_by_luna'; });
+        }
+
+        if (!contextParts.length) throw new Error('Не удалось получить читаемое содержимое вложений.');
+        const context = `\n\n=== ПРИКРЕПЛЁННЫЕ ФАЙЛЫ — ОБЯЗАТЕЛЬНО УЧИТЫВАЙ ПРИ ОТВЕТЕ ===\n${contextParts.join('\n\n---\n\n')}\n=== КОНЕЦ СОДЕРЖИМОГО ВЛОЖЕНИЙ ===\nЕсли содержимое файла противоречит догадке по одному тексту вопроса, опирайся на фактическое содержимое файла. Если нужные данные в файле отсутствуют или не читаются, не выдумывай их и сообщи о неопределённости.`;
+        return { context, metadata };
+    }
+
+    function appendAttachmentContext(prompt) {
+        if (!attachmentContextText) return prompt;
+        return `${prompt}\n\n${attachmentContextText}`;
+    }
+
+
+    // =====================================
+    // 6A. РАЗВЁРНУТЫЕ ОТВЕТЫ — ПОЛЕ И ОКНО
+    // =====================================
+
+    function getEssayField() {
+        const selector = [
+            'textarea:not([disabled]):not([readonly])',
+            '[contenteditable="true"]',
+            '[role="textbox"]',
+            'input[type="text"]:not([disabled]):not([readonly])'
+        ].join(',');
+
+        const candidates = Array.from(document.querySelectorAll(selector))
+            .filter(el => visible(el) && !el.closest('#dvfu-essay-panel-v190'));
+
+        const ranked = candidates.map(el => {
+            const tag = el.tagName.toLowerCase();
+            const meta = [
+                el.getAttribute('placeholder'),
+                el.getAttribute('aria-label'),
+                el.getAttribute('name'),
+                el.id,
+                el.className,
+                el.closest('form')?.className
+            ].join(' ').toLowerCase();
+
+            if (/(search|поиск|filter|фильтр|login|password|пароль|email)/i.test(meta)) {
+                return { el, score: -100 };
+            }
+
+            // Обычный однострочный input учитываем только при явной подсказке,
+            // что это поле ответа.
+            if (tag === 'input' && !/(answer|ответ|essay|text|текст|response)/i.test(meta)) {
+                return { el, score: -100 };
+            }
+
+            let score = 0;
+            if (tag === 'textarea') score += 10;
+            if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') score += 9;
+            if (el.getAttribute('role') === 'textbox') score += 7;
+            if (tag === 'input') score += 2;
+            if (/(answer|ответ|essay|сочин|развернут|развёрнут|response|text|текст)/i.test(meta)) score += 6;
+            if (el.closest('.test__answer, .answer, .essay, .question__answer, .test__body')) score += 4;
+            if (el.closest('#dvfu-essay-panel-v190')) score = -100;
+
+            return { el, score };
+        }).filter(item => item.score > 0)
+          .sort((a, b) => b.score - a.score);
+
+        return ranked[0]?.el || null;
+    }
+
+    function ensureEssayPanel() {
+        if (essayPanel?.isConnected) return;
+
+        const styleId = 'dvfu-essay-studio-style-v190';
+        if (!document.getElementById(styleId)) {
+            const style = document.createElement('style');
+            style.id = styleId;
+            style.textContent = `
+                #dvfu-essay-panel-v190 {
+                    position:fixed; z-index:10000030; top:50%; left:50%; right:auto;
+                    transform:translate(-50%,-50%); width:min(650px,calc(100vw - 28px));
+                    max-height:calc(100vh - 28px); display:none; flex-direction:column;
+                    gap:12px; padding:16px; box-sizing:border-box; overflow:auto;
+                    background:#fff; color:#172033; border:1px solid #cbd5e1;
+                    border-radius:16px; box-shadow:0 12px 42px rgba(15,23,42,.28);
+                    font:14px/1.45 Arial,sans-serif;
+                }
+                #dvfu-essay-panel-v190 * { box-sizing:border-box; min-width:0; }
+                #dvfu-essay-panel-v190 textarea {
+                    display:block; position:static; width:100%; max-width:100%; margin:0;
+                    padding:11px 12px; border:1px solid #cbd5e1; border-radius:10px;
+                    background:#fff; color:#172033; font:14px/1.5 Arial,sans-serif;
+                    box-shadow:none; resize:vertical; outline-offset:2px;
+                }
+                #dvfu-essay-panel-v190 [data-essay-draft] { min-height:170px; max-height:34vh; }
+                #dvfu-essay-panel-v190 [data-essay-custom-prompt] { min-height:72px; max-height:20vh; }
+                #dvfu-essay-panel-v190 button {
+                    appearance:none !important; position:static !important; inset:auto !important;
+                    float:none !important; transform:none !important; display:flex !important;
+                    align-items:center !important; justify-content:center !important;
+                    width:100% !important; min-width:0 !important; max-width:100% !important;
+                    min-height:42px !important; height:auto !important; margin:0 !important;
+                    padding:10px 12px !important; box-sizing:border-box !important;
+                    border:1px solid #cbd5e1 !important; border-radius:9px !important;
+                    background:#f8fafc !important; color:#172033 !important;
+                    font:600 13px/1.35 Arial,sans-serif !important; text-align:center !important;
+                    white-space:normal !important; overflow-wrap:anywhere !important;
+                    cursor:pointer !important; box-shadow:none !important;
+                }
+                #dvfu-essay-panel-v190 button:disabled { opacity:.55 !important; cursor:wait !important; }
+                #dvfu-essay-panel-v190 .dvfu-essay-header { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+                #dvfu-essay-panel-v190 .dvfu-essay-close { width:38px !important; min-width:38px !important; max-width:38px !important; min-height:38px !important; padding:0 !important; border:0 !important; background:transparent !important; color:#64748b !important; font-size:24px !important; }
+                #dvfu-essay-panel-v190 .dvfu-essay-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; width:100%; }
+                #dvfu-essay-panel-v190 .dvfu-essay-custom { display:flex; flex-direction:column; gap:7px; }
+                #dvfu-essay-panel-v190 .dvfu-essay-primary { border:0 !important; background:#059669 !important; color:#fff !important; font-weight:700 !important; }
+                #dvfu-essay-panel-v190 .dvfu-essay-secondary { background:#f8fafc !important; color:#172033 !important; }
+                #dvfu-essay-panel-v190 .dvfu-essay-astra { display:flex; flex-direction:column; gap:6px; padding:10px; border:1px solid #e2e8f0; border-radius:10px; background:#f8fafc; }
+                #dvfu-essay-panel-v190 [data-essay-status], #dvfu-essay-panel-v190 [data-essay-astra-status] { overflow-wrap:anywhere; }
+                @media (max-width:640px) {
+                    #dvfu-essay-panel-v190 { top:12px; bottom:12px; left:12px; right:12px; transform:none; width:auto; max-height:none; padding:12px; gap:10px; }
+                    #dvfu-essay-panel-v190 .dvfu-essay-actions { grid-template-columns:1fr; }
+                    #dvfu-essay-panel-v190 [data-essay-draft] { min-height:140px; max-height:28vh; }
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        essayPanel = document.createElement('section');
+        essayPanel.id = 'dvfu-essay-panel-v190';
+        essayPanel.setAttribute('role', 'dialog');
+        essayPanel.setAttribute('aria-modal', 'false');
+        essayPanel.setAttribute('aria-label', 'Черновик развёрнутого ответа');
+        essayPanel.innerHTML = `
+            <div class="dvfu-essay-header">
+                <div style="font-size:18px;font-weight:700">Черновик ответа</div>
+                <button type="button" class="dvfu-essay-close" data-essay-close aria-label="Закрыть">×</button>
+            </div>
+            <div data-essay-question style="font-size:12px;color:#64748b;max-height:76px;overflow:auto;padding:8px 10px;background:#f1f5f9;border-radius:8px"></div>
+            <label style="font-size:12px;font-weight:700;color:#334155" for="dvfu-essay-draft-v190">Текст ответа</label>
+            <textarea id="dvfu-essay-draft-v190" data-essay-draft spellcheck="true" placeholder="Черновик ответа появится здесь…"></textarea>
+            <div class="dvfu-essay-actions">
+                <button type="button" class="dvfu-essay-secondary" data-essay-action="simplify">Упростить</button>
+                <button type="button" class="dvfu-essay-secondary" data-essay-action="shorten">Укоротить</button>
+            </div>
+            <div class="dvfu-essay-custom">
+                <label for="dvfu-essay-custom-prompt-v190" style="font-size:12px;font-weight:700;color:#334155">Свой промпт — необязательно</label>
+                <textarea id="dvfu-essay-custom-prompt-v190" data-essay-custom-prompt rows="3" placeholder="Например: объясни проще, оставь 2–3 предложения, добавь конкретный пример…"></textarea>
+                <button type="button" class="dvfu-essay-primary" data-essay-action="custom">Применить мой промпт</button>
+            </div>
+            <div class="dvfu-essay-astra">
+                <button type="button" class="dvfu-essay-secondary" data-essay-astra-test>Проверить GPT-6 Astra</button>
+                <div data-essay-astra-status style="font-size:12px;color:#64748b">GPT-6 Astra: ещё не проверена. Проверка отправит короткий тестовый запрос.</div>
+            </div>
+            <button type="button" class="dvfu-essay-primary" data-essay-insert>Вставить в поле ответа</button>
+            <div data-essay-status style="font-size:12px;color:#64748b">Проверь содержание перед вставкой. Ответ не отправляется автоматически.</div>
+        `;
+        document.body.appendChild(essayPanel);
+
+        essayReopenButton = document.createElement('button');
+        essayReopenButton.type = 'button';
+        essayReopenButton.textContent = '📝 Открыть черновик';
+        essayReopenButton.style.cssText = 'appearance:none;display:none;padding:11px 14px;border:0;border-radius:12px;background:#2563eb;color:#fff;font:700 13px/1.3 Arial,sans-serif;cursor:pointer;box-shadow:0 4px 16px rgba(15,23,42,.25)';
+        essayReopenButton.addEventListener('click', () => {
+            essayPanel.style.display = 'flex';
+            essayReopenButton.style.display = 'none';
+        });
+        addDockButton(essayReopenButton);
+
+        essayDraftInput = essayPanel.querySelector('[data-essay-draft]');
+        essayQuestionLabel = essayPanel.querySelector('[data-essay-question]');
+        essayCustomPromptInput = essayPanel.querySelector('[data-essay-custom-prompt]');
+        essayAstraStatus = essayPanel.querySelector('[data-essay-astra-status]');
+        essayPanelStatus = essayPanel.querySelector('[data-essay-status]');
+
+        essayPanel.querySelector('[data-essay-close]').addEventListener('click', () => {
+            essayPanel.style.display = 'none';
+            if (essayReopenButton) essayReopenButton.style.display = 'block';
+        });
+        essayPanel.querySelector('[data-essay-action="simplify"]').addEventListener('click', () => {
+            rewriteEssay('simplify').catch(showEssayError);
+        });
+        essayPanel.querySelector('[data-essay-action="shorten"]').addEventListener('click', () => {
+            rewriteEssay('shorten').catch(showEssayError);
+        });
+        essayPanel.querySelector('[data-essay-action="custom"]').addEventListener('click', () => {
+            rewriteEssay('custom').catch(showEssayError);
+        });
+        essayPanel.querySelector('[data-essay-astra-test]').addEventListener('click', () => {
+            testAstraAvailability().catch(showEssayError);
+        });
+        essayPanel.querySelector('[data-essay-insert]').addEventListener('click', insertEssayIntoField);
+    }
+
+    function setEssayPanelBusy(value) {
+        essayBusy = value;
+        if (!essayPanel) return;
+        essayPanel.querySelectorAll('button').forEach(btn => {
+            if (btn.hasAttribute('data-essay-close')) return;
+            btn.disabled = value;
+        });
+        if (essayDraftInput) essayDraftInput.disabled = value;
+        if (essayCustomPromptInput) essayCustomPromptInput.disabled = value;
+    }
+
+    function cleanEssayText(value) {
+        return String(value || '')
+            .replace(/^\s*```(?:text|markdown)?\s*/i, '')
+            .replace(/\s*```\s*$/i, '')
+            .trim();
+    }
+
+    function openEssayPanel(question, draft, field, fingerprint, auditId) {
+        ensureEssayPanel();
+        essayTargetField = field;
+        essayTargetFingerprint = fingerprint;
+        essayTargetAuditId = auditId || null;
+        essayCurrentQuestion = question || '';
+        essayQuestionLabel.textContent = 'Вопрос: ' + essayCurrentQuestion;
+        essayDraftInput.value = cleanEssayText(draft);
+        essayCustomPromptInput.value = '';
+        essayAstraStatus.textContent = 'GPT-6 Astra: ещё не проверена. Нажми кнопку, чтобы проверить доступность API.';
+        essayAstraStatus.style.color = '#64748b';
+        essayPanelStatus.textContent = 'Проверь ответ. Можно упростить, сократить или задать собственную инструкцию. Вставка не отправляет ответ.';
+        essayPanelStatus.style.color = '#64748b';
+        essayPanel.style.display = 'flex';
+        if (essayReopenButton) essayReopenButton.style.display = 'none';
+        essayDraftInput.focus();
+    }
+
+    function showEssayError(error) {
+        console.error('[DVFU LMS v19.0] Ошибка окна эссе:', error);
+        auditEvent(essayTargetAuditId, 'essay_action_error', { message: error?.message || String(error) });
+        if (essayPanelStatus) {
+            essayPanelStatus.textContent = 'Ошибка: ' + (error?.message || String(error));
+            essayPanelStatus.style.color = '#dc2626';
+        }
+        setEssayPanelBusy(false);
+    }
+
+    async function rewriteEssay(mode) {
+        if (essayBusy) return;
+        const original = cleanEssayText(essayDraftInput?.value);
+        if (!original) throw new Error('Черновик пустой. Сначала дождись генерации ответа.');
+
+        const customInstruction = cleanEssayText(essayCustomPromptInput?.value);
+        if (mode === 'custom' && !customInstruction) {
+            throw new Error('Введи свой промпт в поле «Свой промпт».');
+        }
+
+        const token = generation;
+        let instruction = '';
+        if (mode === 'simplify') {
+            instruction = 'Упрости ответ: используй обычные понятные слова и естественные короткие предложения. Сохрани смысл, важные факты и примерно тот же объём. Не добавляй новые сведения.';
+        } else if (mode === 'shorten') {
+            instruction = 'Сократи ответ примерно на треть. Оставь прямой ответ на вопрос и все ключевые факты. Удали повторы и общие фразы. Не добавляй новых сведений.';
+        } else {
+            instruction = customInstruction;
+        }
+
+        setEssayPanelBusy(true);
+        essayPanelStatus.textContent = mode === 'simplify' ? 'Упрощаю текст через GPT-6 Sol…' : mode === 'shorten' ? 'Сокращаю текст через GPT-6 Sol…' : 'Применяю твой промпт через GPT-6 Sol…';
+        essayPanelStatus.style.color = '#64748b';
+
+        try {
+            if (!API_KEY || API_KEY === 'ВСТАВЬ_НОВЫЙ_API_КЛЮЧ') throw new Error('Не указан API-ключ TokenWave.');
+            const prompt = `ВОПРОС, НА КОТОРЫЙ ОТВЕЧАЕТ ЧЕРНОВИК:\n${essayCurrentQuestion || 'Не указан'}\n\nТЕКУЩИЙ ЧЕРНОВИК:\n${original}\n\nИНСТРУКЦИЯ:\n${instruction}\n\nОБЯЗАТЕЛЬНЫЕ УСЛОВИЯ:\n- Сохрани фактический смысл исходного черновика и не выдумывай новые факты.\n- Не повторяй формулировку вопроса.\n- Не добавляй вступление, заголовок или заключение ради объёма.\n- Начинай сразу с ответа по существу.\n- Верни только переработанный текст, без комментариев и кавычек.`;
+            const raw = await requestModel(PRIMARY_MODEL, prompt, token, 'text', true);
+            if (token !== generation) throw new Error('Страница или вопрос изменились; повтори действие на текущем вопросе.');
+            lastUsedModel = PRIMARY_MODEL;
+            const revised = cleanEssayText(raw);
+            if (!revised) throw new Error('GPT-6 Sol вернула пустой текст.');
+
+            essayDraftInput.value = revised;
+            auditUpdate(essayTargetAuditId, {
+                lastActionModel: PRIMARY_MODEL,
+                draft: revised,
+                finalDraft: revised
+            });
+            auditEvent(essayTargetAuditId, mode === 'custom' ? 'essay_custom_prompt_applied' : mode === 'simplify' ? 'essay_simplified' : 'essay_shortened', {
+                model: PRIMARY_MODEL,
+                customPrompt: mode === 'custom' ? customInstruction : undefined,
+                before: original,
+                after: revised
+            });
+            essayPanelStatus.textContent = mode === 'simplify' ? 'Ответ упрощён. Проверь результат.' : mode === 'shorten' ? 'Ответ сокращён. Проверь результат.' : 'Твой промпт применён. Проверь результат.';
+            essayPanelStatus.style.color = '#047857';
+        } finally {
+            setEssayPanelBusy(false);
+        }
+    }
+
+    async function testAstraAvailability() {
+        if (essayBusy) return;
+        const token = generation;
+        setEssayPanelBusy(true);
+        essayAstraStatus.textContent = 'GPT-6 Astra: отправляю короткий тестовый запрос…';
+        essayAstraStatus.style.color = '#64748b';
+        try {
+            if (!API_KEY || API_KEY === 'ВСТАВЬ_НОВЫЙ_API_КЛЮЧ') throw new Error('Не указан API-ключ TokenWave.');
+            const raw = await requestModel(
+                JUDGE_MODEL,
+                'Ответь строго одним словом: OK',
+                token,
+                'text',
+                true
+            );
+            if (token !== generation) throw new Error('Страница изменилась во время проверки GPT-6 Astra.');
+            lastUsedModel = JUDGE_MODEL;
+            const shortReply = cleanEssayText(raw).slice(0, 100) || 'пустой ответ';
+            essayAstraStatus.textContent = `GPT-6 Astra доступна через TokenWave. Ответ модели: ${shortReply}`;
+            essayAstraStatus.style.color = '#047857';
+            auditEvent(essayTargetAuditId, 'astra_api_test_succeeded', {
+                model: JUDGE_MODEL,
+                response: shortReply
+            });
+        } catch (error) {
+            essayAstraStatus.textContent = `GPT-6 Astra недоступна: ${error?.message || String(error)}`;
+            essayAstraStatus.style.color = '#dc2626';
+            auditEvent(essayTargetAuditId, 'astra_api_test_failed', {
+                model: JUDGE_MODEL,
+                message: error?.message || String(error),
+                status: error?.status || null
+            });
+            throw error;
+        } finally {
+            setEssayPanelBusy(false);
+        }
+    }
+
+    function setEssayFieldValue(field, value) {
+        field.focus();
+
+        if (field.isContentEditable || field.getAttribute('contenteditable') === 'true') {
+            field.textContent = value;
+        } else {
+            const proto = field.tagName === 'TEXTAREA'
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter) setter.call(field, value);
+            else field.value = value;
+        }
+
+        try {
+            field.dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                inputType: 'insertText',
+                data: value
+            }));
+        } catch (_) {
+            field.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function insertEssayIntoField() {
+        const value = cleanEssayText(essayDraftInput?.value);
+        if (!value) {
+            auditEvent(essayTargetAuditId, 'essay_insert_failed', { reason: 'empty_draft' });
+            essayPanelStatus.textContent = 'Сначала подготовь текст ответа.';
+            return;
+        }
+
+        if (essayTargetFingerprint && getFingerprint() !== essayTargetFingerprint) {
+            auditEvent(essayTargetAuditId, 'essay_insert_failed', { reason: 'question_changed' });
+            essayPanelStatus.textContent = 'Похоже, вопрос уже изменился. Черновик не вставлен, чтобы не попасть не в то поле.';
+            essayPanelStatus.style.color = '#dc2626';
+            return;
+        }
+
+        let field = essayTargetField;
+        if (!field?.isConnected) field = getEssayField();
+
+        if (!field) {
+            auditEvent(essayTargetAuditId, 'essay_insert_failed', { reason: 'answer_field_not_found' });
+            essayPanelStatus.textContent = 'Поле ответа не найдено. Открой вопрос с текстовым полем и попробуй снова.';
+            essayPanelStatus.style.color = '#dc2626';
+            return;
+        }
+
+        setEssayFieldValue(field, value);
+        auditUpdate(essayTargetAuditId, {
+            status: 'inserted_into_field',
+            finalDraft: value,
+            insertedAt: new Date().toISOString()
+        });
+        auditEvent(essayTargetAuditId, 'essay_inserted_into_field', {
+            text: value,
+            submittedAutomatically: false
+        });
+        essayPanelStatus.textContent = 'Текст вставлен в поле. Проверь его и отправь ответ вручную.';
+        essayPanelStatus.style.color = '#047857';
+        status('📝 Черновик вставлен — отправь вручную', '#059669');
+    }
+
+    async function solveEssay(token, fingerprint, field) {
+        try {
+            currentAuditEntryId = null;
+            const question = getQuestionText();
+            if (!question || question.length < 8) {
+                throw new Error('Не удалось прочитать формулировку вопроса.');
+            }
+
+            const auditId = auditCreate({ type: 'ESSAY', question });
+            currentAuditEntryId = auditId;
+            status('✍️ Сравниваю черновики GPT-6 Sol и GPT-6 Luna...', '#2563eb');
+
+            const prompt = `Ты помогаешь подготовить естественный студенческий черновик ответа.\n\nВопрос:\n${question}\n\nОтвечай прямо и кратко по существу. Не повторяй вопрос и не начинай с его переформулировки. Первое предложение должно сразу отвечать на вопрос. Пиши простым естественным русским языком, без канцелярита, шаблонных вступлений, общих фраз и искусственного вывода. Для простого вопроса достаточно 1–3 предложений; для вопроса «объясните», «сравните» или «охарактеризуйте» дай необходимую конкретику, но не растягивай текст. Не добавляй вымышленные даты, имена, цитаты, источники или личный опыт. Не имитируй ошибки специально. Если данных недостаточно, честно укажи это коротко.\n\nВерни только готовый ответ, без заголовка, повторения вопроса и комментариев.`;
+
+            const modelAnswers = [];
+            const responses = await askDualAI(prompt, token, 'text', result => {
+                modelAnswers.push({ model: result.model, rawResponse: result.raw, valid: true });
+                auditUpdate(auditId, { modelAnswers: modelAnswers.slice() });
+                auditEvent(auditId, 'model_response', { model: result.model });
+            });
+
+            check(token);
+            const results = responses.map(item => ({
+                model: item.model,
+                raw: item.raw,
+                draft: cleanEssayText(item.raw),
+                displayText: cleanEssayText(item.raw),
+                reason: ''
+            }));
+            if (results.some(item => !item.draft)) {
+                throw new Error('Одна из моделей вернула пустой черновик.');
+            }
+
+            const agreement = results.length === 1 || norm(results[0].draft) === norm(results[1].draft);
+            let selected = results[0];
+
+            auditUpdate(auditId, {
+                model: PRIMARY_MODEL,
+                generationModel: PRIMARY_MODEL,
+                agreement,
+                modelAnswers: results.map(item => ({
+                    model: item.model,
+                    rawResponse: item.raw,
+                    draft: item.draft,
+                    valid: true
+                }))
+            });
+
+            if (!agreement) {
+                auditUpdate(auditId, { status: 'awaiting_model_choice' });
+                auditEvent(auditId, 'model_disagreement', {
+                    models: results.map(item => item.model),
+                    type: 'ESSAY'
+                });
+                status('⚠️ Черновики отличаются — выбери один', '#d97706');
+                selected = await showModelDecision({
+                    question,
+                    type: 'Развёрнутый ответ',
+                    results: results.map(item => ({
+                        model: item.model,
+                        raw: item.draft,
+                        displayText: item.draft
+                    })),
+                    confirmLabel: 'Открыть выбранный черновик'
+                });
+                check(token);
+
+                if (!selected) {
+                    handled.add(fingerprint);
+                    auditUpdate(auditId, { status: 'decision_cancelled', selectionSource: 'user_cancelled' });
+                    auditEvent(auditId, 'model_choice_cancelled');
+                    status('Черновик не выбран — отправки нет', '#d97706');
+                    return;
+                }
+            }
+
+            const draft = selected.draft || selected.raw;
+            // В ESSAY арбитр пока не вызывается: при расхождении выбор делает пользователь.
+            // Сохраняем источник выбора в локальную переменную, чтобы журнал не ссылался
+            // на необъявленную selectionSource.
+            const selectionSource = agreement ? 'model_agreement' : 'user_choice';
+
+            auditUpdate(auditId, {
+                chosenModel: selectionSource === 'model_agreement' ? 'consensus' : selected.model,
+                selectionSource,
+                model: selected.model,
+                generationModel: selected.model,
+                rawModelResponse: selected.raw,
+                draft,
+                finalDraft: draft,
+                status: 'draft_ready'
+            });
+            auditEvent(auditId, selectionSource === 'model_agreement' ? 'models_agreed' : 'answer_selected_after_disagreement', {
+                chosenModel: selected.model,
+                selectionSource,
+                agreement
+            });
+
+            handled.add(fingerprint);
+            openEssayPanel(question, draft, field, fingerprint, auditId);
+            status('📝 Черновик готов — проверь отдельное окно', '#059669');
+
+        } finally {
+            busy = false;
+        }
+    }
+
+    function getFingerprint() {
+        const rows = getAllSlots().map(row => ({
+            title: getSlotTitle(row),
+            filled: isSlotFilled(row)
+        }));
+
+        const cards = getRightCards().map(getText);
+
+        const options = getChoiceOptions().map(option => ({
+            text: option.text,
+            type: option.type
+        }));
+
+        const essayField = getEssayField();
+        const essay = essayField ? {
+            tag: essayField.tagName,
+            name: essayField.getAttribute('name') || '',
+            placeholder: essayField.getAttribute('placeholder') || '',
+            id: essayField.id || ''
+        } : null;
+
+        return JSON.stringify({
+            question: getQuestionText(),
+            rows,
+            cards,
+            options,
+            essay,
+            attachments: getQuestionAttachments().map(item => ({ filename: item.filename, url: item.url }))
+        });
+    }
+
+    // =====================================
+    // 7. MATCH — ПОЛУЧЕНИЕ ОТВЕТОВ
+    // =====================================
+
+    function validIndexes(indexes, cardCount, slotCount) {
+        if (
+            !Array.isArray(indexes) ||
+            indexes.length !== slotCount
+        ) {
+            return false;
+        }
+
+        const numbers = indexes.map(Number);
+
+        return numbers.every(n =>
+            Number.isInteger(n) &&
+            n >= 1 &&
+            n <= cardCount
+        ) &&
+        new Set(numbers).size === slotCount;
+    }
+
+    function parseMatchCandidate(item, slots, cards) {
+        let parsed;
+        try {
+            parsed = parseJSON(item.raw);
+        } catch (error) {
+            return {
+                model: item.model,
+                raw: item.raw,
+                valid: false,
+                error: `не удалось разобрать JSON: ${error.message || error}`,
+                indexes: []
+            };
+        }
+
+        const sourceIndexes = parsed && Array.isArray(parsed.indexes)
+            ? parsed.indexes
+            : [];
+        const indexes = sourceIndexes.map(Number);
+
+        if (sourceIndexes.length !== slots.length) {
+            return {
+                model: item.model,
+                raw: item.raw,
+                valid: false,
+                error: `ожидалось ${slots.length} номеров, получено ${sourceIndexes.length}`,
+                indexes
+            };
+        }
+
+        const outOfRange = indexes.filter(n =>
+            !Number.isInteger(n) || n < 1 || n > cards.length
+        );
+        if (outOfRange.length) {
+            return {
+                model: item.model,
+                raw: item.raw,
+                valid: false,
+                error: `номера должны быть от 1 до ${cards.length}; неверные: ${outOfRange.join(', ')}`,
+                indexes
+            };
+        }
+
+        if (new Set(indexes).size !== slots.length) {
+            return {
+                model: item.model,
+                raw: item.raw,
+                valid: false,
+                error: 'повторяются номера карточек; каждая карточка должна использоваться один раз',
+                indexes
+            };
+        }
+
+        return {
+            model: item.model,
+            raw: item.raw,
+            valid: true,
+            indexes,
+            reason: String(parsed.reason || parsed.explanation || '')
+                .replace(/\s+/g, ' ').trim().slice(0, 240),
+            confidence: readModelConfidence(parsed.confidence),
+            displayText: indexes.map((cardIndex, i) =>
+                `${i + 1}. ${slots[i]} → ${cards[cardIndex - 1]}`
+            ).join('\n')
+        };
+    }
+
+    async function retryMatchFormat(item, candidate, prompt, slots, cards, token, auditId) {
+        const repairPrompt = `${prompt}
+
+ВАЖНО: предыдущий ответ не прошёл техническую проверку: ${candidate.error}.
+Реши исходное задание заново. Нужно вернуть ровно ${slots.length} целых уникальных номеров.
+Допустимый диапазон номеров: от 1 до ${cards.length}.
+Не добавляй номера позиций слева — нужны только номера карточек справа.
+Верни строго JSON без Markdown и текста вокруг:
+{"indexes":[1,2,3,4],"confidence":0.0,"reason":"кратко"}`;
+
+        auditEvent(auditId, 'match_format_retry_started', {
+            model: item.model,
+            validationError: candidate.error
+        });
+        status(`🔁 ${modelLabel(item.model)} исправляет формат ответа...`, '#d97706');
+
+        try {
+            const retryRaw = await requestModel(item.model, repairPrompt, token, 'json', false);
+            check(token);
+            const retried = parseMatchCandidate({
+                model: item.model,
+                raw: retryRaw
+            }, slots, cards);
+
+            auditEvent(auditId, 'match_format_retry_result', {
+                model: item.model,
+                valid: retried.valid,
+                validationError: retried.error || ''
+            });
+
+            return {
+                ...retried,
+                originalRaw: item.raw,
+                retryRaw
+            };
+        } catch (error) {
+            auditEvent(auditId, 'match_format_retry_failed', {
+                model: item.model,
+                message: error?.message || String(error)
+            });
+            return {
+                ...candidate,
+                originalRaw: item.raw,
+                retryError: error?.message || String(error)
+            };
+        }
+    }
+
+    async function getMatchAnswers(slots, cards, token, auditId, fingerprint) {
+        const question = getQuestionText();
+        const prompt = `ЗАДАНИЕ:\n${question}\n\nПозиции слева:\n${slots.map((s, i) => `${i + 1}. ${s}`).join('\n')}\n\nДоступные карточки справа:\n${cards.map((c, i) => `${i + 1}. ${c}`).join('\n')}\n\nТребуется выбрать ровно ${slots.length} уникальных карточек. Если это хронология, расположи события от раннего к позднему. Если это сопоставление, установи соответствие. Используй только номера карточек справа, а не номера позиций. Каждый номер можно использовать только один раз. Номера должны быть целыми числами от 1 до ${cards.length}. Не повторяй вопрос и не описывай ход рассуждений.\n\nВерни только JSON: {"indexes":[1,2,3,4],"confidence":0.0,"reason":"одно короткое объяснение, до 15 слов"}`;
+
+        const responses = await askDualAI(prompt, token, 'json', result => {
+            auditEvent(auditId, 'model_response', { model: result.model });
+        });
+
+        const candidates = [];
+        for (const item of responses) {
+            check(token);
+            let candidate = parseMatchCandidate(item, slots, cards);
+
+            if (!candidate.valid) {
+                auditEvent(auditId, 'match_invalid_model_response', {
+                    model: item.model,
+                    validationError: candidate.error,
+                    rawResponse: item.raw
+                });
+                candidate = await retryMatchFormat(
+                    item, candidate, prompt, slots, cards, token, auditId
+                );
+            }
+
+            candidates.push(candidate);
+        }
+
+        const results = candidates.filter(item => item.valid);
+        auditUpdate(auditId, {
+            modelAnswers: candidates.map(item => ({
+                model: item.model,
+                rawResponse: item.raw,
+                originalRawResponse: item.originalRaw || item.raw,
+                retryRawResponse: item.retryRaw || '',
+                indexes: item.indexes || [],
+                reason: item.reason || '',
+                confidence: item.confidence ?? null,
+                valid: item.valid,
+                validationError: item.error || '',
+                retryError: item.retryError || ''
+            }))
+        });
+
+        if (!results.length) {
+            const details = candidates
+                .map(item => `${modelLabel(item.model)}: ${item.error || item.retryError || 'некорректный ответ'}`)
+                .join('; ');
+            throw new Error(`Обе модели не вернули допустимый набор карточек. ${details}`);
+        }
+
+        const agreement = results.length === 2 &&
+            sameIndexResult(results[0].indexes, results[1].indexes, false);
+
+        let selected = results[0];
+        let selectionSource = agreement ? 'model_agreement' : 'user_choice';
+
+        auditUpdate(auditId, {
+            agreement: results.length === 2 ? agreement : null,
+            status: results.length === 1 ? 'one_valid_model_confirmation' : 'model_comparison'
+        });
+
+        const lowConfidence = hasLowConfidence(results);
+        const needsArbitration = results.length > 1 && (!agreement || lowConfidence);
+
+        if (needsArbitration) {
+            const reasons = [];
+            if (results.length < 2) reasons.push('только одна модель вернула корректный ответ');
+            if (!agreement) reasons.push('модели расходятся');
+            if (lowConfidence) reasons.push('низкая или неуказанная уверенность');
+            auditUpdate(auditId, { status: 'judge_review', arbitrationReasons: reasons });
+            auditEvent(auditId, 'judge_started_by_condition', { type: 'MATCH', reasons });
+            status('⚖️ GPT-6 Astra проверяет сложный случай...', '#7c3aed');
+
+            const arbitration = await runDisagreementJudge({
+                question,
+                type: 'MATCH / хронология / сопоставление',
+                slots,
+                cards,
+                results,
+                token,
+                auditId,
+                validate: indexes => validIndexes(indexes, cards.length, slots.length),
+                displayText: indexes => indexes.map((cardIndex, i) =>
+                    `${i + 1}. ${slots[i]} → ${cards[cardIndex - 1]}`
+                ).join('\n')
+            });
+            check(token);
+
+            if (arbitration.accepted) {
+                selected = arbitration.result;
+                selectionSource = 'third_model_judge';
+                status('⚖️ GPT-6 Astra подтвердила обоснованный вариант', '#7c3aed');
+            } else {
+                auditUpdate(auditId, { status: 'awaiting_model_choice' });
+                status('⚠️ Нужна ручная проверка ответа', '#d97706');
+                const baseResults = agreement ? [results[0]] : results;
+                const decisionResults = arbitration.result?.valid
+                    ? [...baseResults, arbitration.result]
+                    : baseResults;
+
+                selected = await showModelDecision({
+                    question,
+                    type: 'Match / хронология',
+                    results: decisionResults,
+                    confirmLabel: 'Подтвердить вариант и продолжить'
+                });
+                check(token);
+
+                if (!selected) {
+                    handled.add(fingerprint);
+                    auditUpdate(auditId, {
+                        status: 'decision_cancelled',
+                        selectionSource: 'user_cancelled'
+                    });
+                    auditEvent(auditId, 'model_choice_cancelled');
+                    status('Match не заполнен — выбор отменён', '#d97706');
+                    return null;
+                }
+
+                selectionSource = selected.model === JUDGE_MODEL
+                    ? 'user_selected_judge'
+                    : 'user_choice';
+            }
+        }
+        auditUpdate(auditId, {
+            chosenModel: selectionSource === 'model_agreement' ? 'consensus' : selected.model,
+            selectionSource,
+            model: selected.model,
+            generationModel: selected.model,
+            rawModelResponse: selected.raw,
+            selectedIndexes: selected.indexes,
+            selectedAnswers: selected.indexes.map((cardIndex, i) => ({
+                position: slots[i],
+                card: cards[cardIndex - 1]
+            }))
+        });
+        auditEvent(auditId, selectionSource === 'model_agreement' ? 'models_agreed' :
+            selectionSource === 'third_model_judge' ? 'judge_selected_answer' :
+            'answer_selected_after_disagreement', {
+                chosenModel: selected.model,
+                selectionSource,
+                agreement
+            });
+
+        return selected.indexes;
+    }
+
+    // =====================================
+    // 8. MATCH — ПРОВЕРКА РАЗМЕЩЕНИЯ
+    // =====================================
+
+    async function waitForFilled(before, token) {
+        for (let i = 0; i < 40; i++) {
+            await sleep(100);
+
+            check(token);
+
+            const after = getEmptySlots().length;
+
+            if (after === before - 1) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // =====================================
+    // 9. MATCH — ОСНОВНОЙ АЛГОРИТМ
+    // =====================================
+
+    async function solveMatching(token, fingerprint) {
+        try {
+            currentAuditEntryId = null;
+            status('🔎 Анализирую Match...');
+
+            const rows = getAllSlots();
+            const emptyRows = getEmptySlots();
+            const rightCards = getRightCards();
+
+            const slotDescriptions = emptyRows.map(
+                getSlotTitle
+            );
+
+            const cardTexts = rightCards.map(getText);
+            const auditId = auditCreate({
+                type: 'MATCH',
+                question: getQuestionText(),
+                slots: slotDescriptions,
+                cards: cardTexts
+            });
+
+            console.log('[DVFU LMS] Всего позиций:', rows.length);
+            console.log('[DVFU LMS] Заполнено:', rows.length - emptyRows.length);
+            console.log('[DVFU LMS] Свободно:', emptyRows.length);
+            console.log('[DVFU LMS] Карточек справа:', rightCards.length);
+
+            if (!emptyRows.length) {
+                handled.add(fingerprint);
+                status('✅ Match уже заполнен');
+                return;
+            }
+
+            if (rightCards.length < emptyRows.length) {
+                throw new Error('Карточек меньше, чем свободных позиций');
+            }
+
+            if (slotDescriptions.some(s => !s)) {
+                throw new Error('Не удалось прочитать названия позиций');
+            }
+
+            status('🤖 Подбираю соответствия...');
+
+            const indexes = await getMatchAnswers(
+                slotDescriptions,
+                cardTexts,
+                token,
+                auditId,
+                fingerprint
+            );
+
+            check(token);
+            if (!indexes) return;
+
+            status('🖱️ Размещаю карточки...');
+
+            for (let i = 0; i < indexes.length; i++) {
+                check(token);
+
+                const wanted = norm(
+                    cardTexts[indexes[i] - 1]
+                );
+
+                const card = getRightCards().find(
+                    el => norm(getText(el)) === wanted
+                );
+
+                if (!card) {
+                    throw new Error(
+                        'Карточка не найдена: ' + wanted
+                    );
+                }
+
+                const before = getEmptySlots().length;
+
+                card.click();
+
+                if (!await waitForFilled(before, token)) {
+                    throw new Error(
+                        'LMS не подтвердила размещение: ' + wanted
+                    );
+                }
+
+                console.log(
+                    `[DVFU LMS] Размещено ${i + 1}/${indexes.length}:`,
+                    wanted
+                );
+                auditEvent(auditId, 'card_placed', {
+                    position: slotDescriptions[i],
+                    card: cardTexts[indexes[i] - 1],
+                    progress: `${i + 1}/${indexes.length}`
+                });
+
+                await sleep(CONFIG.delay);
+            }
+
+            check(token);
+
+            if (getEmptySlots().length !== 0) {
+                throw new Error('Остались незаполненные позиции');
+            }
+
+            handled.add(fingerprint);
+            auditUpdate(auditId, { status: 'filled', completedAt: new Date().toISOString() });
+            auditEvent(auditId, 'all_slots_filled');
+
+            status('✅ Match заполнен', '#059669');
+
+            await submitAnswer(token, auditId);
+
+        } finally {
+            busy = false;
+        }
+    }
+
+    // =====================================
+    // 10. RADIO / CHECKBOX — ОТВЕТЫ AI
+    // =====================================
+
+    function validChoiceIndexes(indexes, count, multiple) {
+        if (
+            !Array.isArray(indexes) ||
+            !indexes.length
+        ) {
+            return false;
+        }
+
+        const values = indexes.map(Number);
+
+        if (
+            values.some(n =>
+                !Number.isInteger(n) ||
+                n < 1 ||
+                n > count
+            )
+        ) {
+            return false;
+        }
+
+        if (new Set(values).size !== values.length) {
+            return false;
+        }
+
+        if (!multiple && values.length !== 1) {
+            return false;
+        }
+
+        return true;
+    }
+
+    async function solveChoice(token, fingerprint) {
+        try {
+            currentAuditEntryId = null;
+            const options = getChoiceOptions();
+            if (options.length < 2) throw new Error('Не найдены варианты ответа');
+
+            const multiple = options.some(option => option.type === 'checkbox');
+            const question = getQuestionText();
+            const auditId = auditCreate({
+                type: multiple ? 'CHECKBOX' : 'RADIO',
+                question,
+                options: options.map(option => option.text)
+            });
+
+            const prompt = `Вопрос:\n${question}\n\nВарианты ответов:\n${options.map((option, index) => `${index + 1}. ${option.text}`).join('\n')}\n\n${multiple ? 'Выбери все правильные варианты. Их может быть несколько.' : 'Выбери ровно один правильный вариант.'}\n\nНе повторяй вопрос, не пересказывай варианты и не расписывай рассуждение. Используй только номера ответов.\nВерни только JSON: {"indexes":[1],"confidence":0.0,"reason":"одно короткое объяснение, до 15 слов"}`;
+
+            status(multiple ? '🤖 GPT-6 Sol и GPT-6 Luna анализируют Checkbox...' : '🤖 GPT-6 Sol и GPT-6 Luna анализируют Radio...');
+
+            const modelAnswers = [];
+            const responses = await askDualAI(prompt, token, 'json', result => {
+                modelAnswers.push({ model: result.model, rawResponse: result.raw, valid: null });
+                auditUpdate(auditId, { modelAnswers: modelAnswers.slice() });
+                auditEvent(auditId, 'model_response', { model: result.model });
+            });
+            check(token);
+
+            const results = responses.map(item => {
+                const parsed = parseJSON(item.raw);
+                if (!validChoiceIndexes(parsed.indexes, options.length, multiple)) {
+                    throw new Error(`${modelLabel(item.model)} вернула некорректный набор вариантов`);
+                }
+                const indexes = parsed.indexes.map(Number);
+                return {
+                    model: item.model,
+                    raw: item.raw,
+                    indexes,
+                    reason: String(parsed.reason || parsed.explanation || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+                    confidence: readModelConfidence(parsed.confidence),
+                    displayText: indexes.map(index => `${index}. ${options[index - 1].text}`).join('\n')
+                };
+            });
+
+            const agreement = results.length > 1 && sameIndexResult(results[0].indexes, results[1].indexes, multiple);
+            let selected = results[0];
+            if (!selected) {
+                throw new Error('Модель не вернула ответ');
+            }
+            auditUpdate(auditId, {
+                agreement,
+                modelAnswers: results.map(item => ({
+                    model: item.model,
+                    rawResponse: item.raw,
+                    indexes: item.indexes,
+                    reason: item.reason,
+                    confidence: item.confidence ?? null,
+                    valid: true
+                }))
+            });
+
+            let selectionSource = agreement ? 'model_agreement' : 'user_choice';
+            const lowConfidence = hasLowConfidence(results);
+            const needsArbitration = results.length > 1 && (!agreement || lowConfidence);
+
+            if (needsArbitration) {
+                const reasons = [];
+                if (!agreement) reasons.push('модели расходятся');
+                if (lowConfidence) reasons.push('низкая или неуказанная уверенность');
+                auditUpdate(auditId, { status: 'judge_review', arbitrationReasons: reasons });
+                auditEvent(auditId, 'judge_started_by_condition', { type: multiple ? 'CHECKBOX' : 'RADIO', reasons });
+                const arbitration = await runDisagreementJudge({
+                    question,
+                    type: multiple ? 'CHECKBOX' : 'RADIO',
+                    options: options.map(option => option.text),
+                    multiple,
+                    results,
+                    token,
+                    auditId,
+                    validate: indexes => validChoiceIndexes(indexes, options.length, multiple),
+                    displayText: indexes => indexes.map(index => `${index}. ${options[index - 1].text}`).join('\n')
+                });
+                check(token);
+
+                if (arbitration.accepted) {
+                    selected = arbitration.result;
+                    selectionSource = 'third_model_judge';
+                    status('⚖️ GPT-6 Astra подтвердила обоснованный вариант', '#7c3aed');
+                } else {
+                    auditUpdate(auditId, { status: 'awaiting_model_choice' });
+                    status('⚠️ Нужна ручная проверка ответа', '#d97706');
+                    const baseResults = agreement ? [results[0]] : results;
+                    const decisionResults = arbitration.result?.valid
+                        ? [...baseResults, arbitration.result]
+                        : baseResults;
+                    selected = await showModelDecision({
+                        question,
+                        type: multiple ? 'Checkbox — несколько ответов' : 'Radio — один ответ',
+                        results: decisionResults
+                    });
+                    check(token);
+                    if (!selected) {
+                        handled.add(fingerprint);
+                        auditUpdate(auditId, { status: 'decision_cancelled', selectionSource: 'user_cancelled' });
+                        auditEvent(auditId, 'model_choice_cancelled');
+                        status('Ответ не выбран — отправки нет', '#d97706');
+                        return;
+                    }
+                    selectionSource = selected.model === JUDGE_MODEL ? 'user_selected_judge' : 'user_choice';
+                }
+            }
+            const indexes = selected.indexes.map(Number);
+            auditUpdate(auditId, {
+                chosenModel: selectionSource === 'model_agreement' ? 'consensus' : selected.model,
+                selectionSource,
+                model: selected.model,
+                generationModel: selected.model,
+                rawModelResponse: selected.raw,
+                selectedIndexes: indexes,
+                selectedAnswers: indexes.map(index => options[index - 1].text)
+            });
+            auditEvent(auditId, selectionSource === 'model_agreement' ? 'models_agreed' : selectionSource === 'third_model_judge' ? 'judge_selected_answer' : 'answer_selected_after_disagreement', {
+                chosenModel: selected.model,
+                selectionSource,
+                agreement
+            });
+
+            status('🖱️ Выбираю подтверждённый вариант...');
+            for (const index of indexes) {
+                check(token);
+                const option = options[index - 1];
+                const input = option.input;
+                if (!input.checked) {
+                    input.click();
+                    await sleep(200);
+                }
+                if (!input.checked) throw new Error('Не удалось выбрать: ' + option.text);
+                console.log('[DVFU LMS] Выбран ответ:', option.text);
+                auditEvent(auditId, 'option_selected', { index, text: option.text, type: option.type });
+            }
+
+            check(token);
+            for (const index of indexes) {
+                if (!options[index - 1].input.checked) throw new Error('Выбор ответа не подтверждён');
+            }
+
+            handled.add(fingerprint);
+            auditUpdate(auditId, { status: 'selected' });
+            await sleep(400);
+            await submitAnswer(token, auditId);
+
+        } finally {
+            busy = false;
+        }
+    }
+
+    function captureVisibleFeedback(auditId) {
+        const selectors = [
+            '.test__feedback',
+            '.test__result',
+            '.question__feedback',
+            '.answer__feedback',
+            '.feedback',
+            '[role="alert"]',
+            '[class*="correct"]',
+            '[class*="incorrect"]',
+            '[class*="wrong"]'
+        ];
+        const nodes = Array.from(document.querySelectorAll(selectors.join(',')))
+            .filter(el => visible(el) &&
+                !el.closest('#dvfu-audit-panel-v190, #dvfu-essay-panel-v190'));
+        const seen = new Set();
+        const feedback = nodes.map(el => ({
+            className: typeof el.className === 'string' ? el.className : '',
+            text: getText(el).slice(0, 800)
+        })).filter(item => {
+            const key = `${item.className}::${item.text}`;
+            if (!item.text || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        }).slice(0, 20);
+
+        auditUpdate(auditId, {
+            visibleFeedback: feedback,
+            feedbackCapturedAt: new Date().toISOString()
+        });
+        auditEvent(auditId, 'post_submit_feedback_captured', {
+            found: feedback.length > 0,
+            count: feedback.length
+        });
+    }
+
+    // =====================================
+    // 11. КНОПКА ОТВЕТИТЬ
+    // =====================================
+
+    async function submitAnswer(token, auditId = currentAuditEntryId) {
+    check(token);
+
+    // Ищем кнопку следующего вопроса
+    function findNext() {
+        return [...document.querySelectorAll('button')]
+            .find(b =>
+                visible(b) &&
+                !b.disabled &&
+                /следующий вопрос|next question/i.test(
+                    getText(b)
+                )
+            );
+    }
+
+    // Ищем кнопку отправки
+    function findAnswer() {
+        return [...document.querySelectorAll('button')]
+            .find(b =>
+                visible(b) &&
+                !b.disabled &&
+                /^ответить$/i.test(getText(b))
+            );
+    }
+
+    // Если ответ ещё не отправлен — отправляем
+    const submit = findAnswer();
+
+    if (submit) {
+        status('📨 Отправляю ответ...', '#2563eb');
+        submit.click();
+        auditEvent(auditId, 'answer_submit_clicked');
+        auditUpdate(auditId, { status: 'submit_clicked', submitClickedAt: new Date().toISOString() });
+    } else {
+        auditEvent(auditId, 'answer_button_not_found_or_disabled');
+    }
+
+    // Ожидаем появления следующего вопроса
+    let next = null;
+
+    for (let i = 0; i < 50; i++) {
+        check(token);
+
+        next = findNext();
+
+        if (next) break;
+
+        await sleep(200);
+    }
+
+    if (!next) {
+        captureVisibleFeedback(auditId);
+        status(
+            '⚠️ Кнопка следующего вопроса не найдена',
+            '#d97706'
+        );
+        auditUpdate(auditId, {
+            status: submit ? 'submit_clicked_waiting_next' : 'next_button_not_found'
+        });
+        return;
+    }
+
+    captureVisibleFeedback(auditId);
+    status('➡️ Перехожу к следующему вопросу...', '#2563eb');
+
+    next.click();
+    auditEvent(auditId, 'next_question_clicked', { buttonText: getText(next) });
+    auditUpdate(auditId, { status: 'submitted_and_advanced', advancedAt: new Date().toISOString() });
+
+    await sleep(1200);
+
+    check(token);
+
+    status('🔎 Ожидаю загрузки нового вопроса...');
+}
+    // =====================================
+    // 12. ГЛАВНЫЙ ДИСПЕТЧЕР
+    // =====================================
+
+    setInterval(() => {
+        if (!running || busy || screenshotBusy) return;
+
+        const token = generation;
+
+        const rows = getAllSlots();
+        const cards = getRightCards();
+        const options = getChoiceOptions();
+
+        const fingerprint = getFingerprint();
+
+        if (!fingerprint || handled.has(fingerprint)) {
+            return;
+        }
+
+        if (
+            Date.now() <
+            (retryAfter.get(fingerprint) || 0)
+        ) {
+            return;
+        }
+
+        // Сначала автоматически читаем все вложения текущего вопроса.
+        // Если файл не удалось прочитать, обычное решение не запускается без контекста.
+        const currentAttachments = getQuestionAttachments();
+        if (currentAttachments.length) {
+            if (attachmentFailedFingerprint === fingerprint) return;
+            if (attachmentContextFingerprint !== fingerprint) {
+                if (attachmentPreparationFingerprint !== fingerprint) {
+                    attachmentPreparationFingerprint = fingerprint;
+                    busy = true;
+                    status('📎 Найдено вложение — читаю PNG/JPG/DOCX...', '#7c3aed');
+                    prepareAttachmentsForQuestion(token, fingerprint)
+                        .then(result => {
+                            if (token !== generation || getFingerprint() !== fingerprint) return;
+                            attachmentContextText = result.context;
+                            attachmentContextFingerprint = fingerprint;
+                            activeAttachmentMetadata = result.metadata;
+                            attachmentFailedFingerprint = '';
+                            console.log('[DVFU LMS v19.0] Вложения прочитаны:', result.metadata);
+                            status('📎 Вложения прочитаны — запускаю решение...', '#059669');
+                        })
+                        .catch(error => {
+                            if (token === generation && getFingerprint() === fingerprint) {
+                                const message = error?.message || String(error);
+                                attachmentFailedFingerprint = fingerprint;
+                                const attachmentAuditId = auditCreate({
+                                    type: 'ATTACHMENT_PREPARATION',
+                                    question: getQuestionText(),
+                                    attachments: currentAttachments.map(item => ({ filename: item.filename, type: item.extension }))
+                                });
+                                auditError(attachmentAuditId, error);
+                                console.error('[DVFU LMS v19.0] Ошибка чтения вложения:', error);
+                                status('❌ Вложение не прочитано: ' + message.slice(0, 70), '#dc2626');
+                            }
+                        })
+                        .finally(() => {
+                            if (token === generation) busy = false;
+                        });
+                }
+                return;
+            }
+        } else {
+            attachmentContextText = '';
+            attachmentContextFingerprint = fingerprint;
+            activeAttachmentMetadata = [];
+            attachmentFailedFingerprint = '';
+        }
+
+        // ВЕТКА 1: MATCH
+        // Запускается только если найдены позиции
+        // и карточки справа.
+
+        if (rows.length > 0 && cards.length > 0) {
+            busy = true;
+
+            console.log('[DVFU LMS] Тип задания: MATCH');
+
+            solveMatching(token, fingerprint)
+                .catch(error => {
+                    if (running && token === generation) {
+                        console.error(error);
+                        auditError(currentAuditEntryId, error);
+
+                        status(
+                            '❌ ' + error.message.slice(0, 55),
+                            '#dc2626'
+                        );
+
+                        retryAfter.set(
+                            fingerprint,
+                            Date.now() + 20000
+                        );
+                    }
+
+                    busy = false;
+                });
+
+            return;
+        }
+
+        // ВЕТКА 2: RADIO / CHECKBOX
+        // Эта ветка работает независимо от MATCH.
+
+        if (options.length >= 2) {
+            busy = true;
+
+            console.log(
+                '[DVFU LMS] Тип задания:',
+                options[0].type.toUpperCase()
+            );
+
+            solveChoice(token, fingerprint)
+                .catch(error => {
+                    if (running && token === generation) {
+                        console.error(error);
+                        auditError(currentAuditEntryId, error);
+
+                        status(
+                            '❌ ' + error.message.slice(0, 55),
+                            '#dc2626'
+                        );
+
+                        retryAfter.set(
+                            fingerprint,
+                            Date.now() + 20000
+                        );
+                    }
+
+                    busy = false;
+                });
+
+            return;
+        }
+
+        // ВЕТКА 3: РАЗВЁРНУТЫЙ ОТВЕТ.
+        // Черновик показывается в отдельном окне; сам тест не отправляется.
+        const essayField = getEssayField();
+        if (essayField) {
+            busy = true;
+            console.log('[DVFU LMS] Тип задания: ESSAY');
+
+            solveEssay(token, fingerprint, essayField)
+                .catch(error => {
+                    if (running && token === generation) {
+                        console.error(error);
+                        auditError(currentAuditEntryId, error);
+                        status('❌ ' + error.message.slice(0, 55), '#dc2626');
+                        retryAfter.set(fingerprint, Date.now() + 20000);
+                    }
+                    busy = false;
+                });
+
+            return;
+        }
+
+    }, 1000);
+
+    console.log(
+        '[DVFU LMS] Автопилот v19.0 загружен — автоматическое чтение PNG/JPG/JPEG/DOCX + Visual Solver'
+    );
+
+})();
